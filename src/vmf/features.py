@@ -158,16 +158,25 @@ class RemoteFeatureExtractor:
 
     def __post_init__(self):
         import httpx
+        # Disable keep-alive pooling. With concurrent encode() calls from the
+        # pipelined encoder (`encode_inflight`>1) and uvicorn closing idle
+        # keep-alive sockets, reused connections often arrive at the server
+        # after it has already closed them — yielding "Server disconnected
+        # without sending a response". Fresh connection per request is a few
+        # ms of extra TCP/TLS overhead and rock-solid under concurrency.
         self._client = httpx.Client(
             base_url=self.endpoint.rstrip("/"),
             headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            timeout=httpx.Timeout(180.0, connect=15.0),
+            limits=httpx.Limits(max_keepalive_connections=0),
         )
 
     def encode(self, frames: np.ndarray) -> np.ndarray:
         """frames: (B, H, W, 3) uint8 → (B, dim) float32, L2-normalised on the server."""
         import base64
         import io
+        import time
+        import httpx
         from PIL import Image
 
         inputs: list[str] = []
@@ -176,19 +185,25 @@ class RemoteFeatureExtractor:
             Image.fromarray(fr).save(buf, format="JPEG", quality=88)
             inputs.append(base64.b64encode(buf.getvalue()).decode("ascii"))
 
-        resp = self._client.post(
-            "/embeddings",
-            json={"model": self.name, "input": inputs, "encoding_format": "float"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        data = sorted(payload["data"], key=lambda d: d["index"])
-        out = np.asarray([d["embedding"] for d in data], dtype=np.float32)
-        if out.shape != (len(frames), self.dim):
-            raise RuntimeError(
-                f"server returned shape {out.shape}, expected ({len(frames)}, {self.dim})"
-            )
-        return out
+        payload = {"model": self.name, "input": inputs, "encoding_format": "float"}
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                resp = self._client.post("/embeddings", json=payload)
+                resp.raise_for_status()
+                data = sorted(resp.json()["data"], key=lambda d: d["index"])
+                out = np.asarray([d["embedding"] for d in data], dtype=np.float32)
+                if out.shape != (len(frames), self.dim):
+                    raise RuntimeError(
+                        f"server returned shape {out.shape}, "
+                        f"expected ({len(frames)}, {self.dim})"
+                    )
+                return out
+            except (httpx.RemoteProtocolError, httpx.ReadError,
+                    httpx.ConnectError, httpx.PoolTimeout) as e:
+                last_err = e
+                time.sleep(0.2 * (attempt + 1))  # 0.2, 0.4, 0.6, ...
+        raise RuntimeError(f"encode failed after retries: {last_err}") from last_err
 
 
 def load_remote_extractor(endpoint: str, api_key: str) -> RemoteFeatureExtractor:
