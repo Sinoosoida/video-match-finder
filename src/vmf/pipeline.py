@@ -11,6 +11,7 @@ from rich.console import Console
 from tqdm import tqdm
 
 from vmf import align, frames, hough, weights
+from vmf.async_index import AsyncIndexer
 from vmf.config import VIDEO_EXTS, Config
 from vmf.features import FeatureExtractor, load_extractor, load_remote_extractor
 from vmf.index import Store, file_sha1
@@ -39,151 +40,119 @@ def discover_videos(roots: Iterable[Path]) -> list[Path]:
     return sorted(set(out))
 
 
-def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
-    """Return (vectors, timestamps, mirror_flags, info) or None on failure.
+def _decode_video_to_batches(
+    path: Path, cfg: Config, info: "frames.VideoInfo",
+) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    """Decode one video to a list of (frame_batch, timestamps) batches.
 
-    Pipelined: ffmpeg keeps decoding while encode-batches are sent to the
-    extractor concurrently. The main loop submits batches to a thread pool
-    and blocks only when `encode_inflight` jobs are already in flight,
-    keeping ffmpeg, JPEG-encode, network/IO, and the GPU (or remote GPU)
-    overlapped end-to-end without buffering an entire video in RAM.
-
-    Crop handling:
-      * keyframes_only + cropdetect: cropdetect runs inline in the same
-        ffmpeg pass (free — passthrough filter). We collect per-frame crop
-        coordinates from stderr, aggregate via median, and only re-decode if
-        a meaningful letterbox was found. So 99 % of videos cost one disk
-        read; the 1 % with real letterbox cost two.
-      * uniform-fps + cropdetect: a separate cropdetect pre-pass runs first
-        (cheap with -skip_frame nokey but still a small disk hit).
+    Buffers the whole video in RAM (~10 MB for typical 100-frame keyframe
+    set) so the cropdetect-redo decision can be made before any batches
+    are submitted to the encoder pool. The encoder side then receives a
+    consistent, complete set of frames per video.
     """
-    try:
-        info = frames.probe(path)
-    except frames.FFmpegError as e:
-        console.print(f"[red]skip[/red] {path.name}: {e}")
-        return None
-
-    n_inflight = max(1, getattr(cfg, "encode_inflight", 2))
-
-    def _decode_pass(
-        crop_filter: str | None,
-        collect_crops: bool,
-    ) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], list[tuple[int, int, int, int]]] | None:
-        """Run one full decode → encode → buffer pass. Returns (collected, crops_seen)."""
-        collected: list[tuple[np.ndarray, np.ndarray, int]] = []
-        inflight: list[tuple[Future, np.ndarray, int]] = []
-        crops_seen: list[tuple[int, int, int, int]] = []
-
-        def drain_one() -> bool:
-            if not inflight:
-                return False
-            fut, ts, mflag = inflight.pop(0)
-            v = fut.result()                          # may raise; propagated to caller
-            collected.append((v, ts, mflag))
-            return True
-
-        def maybe_drain() -> None:
-            while len(inflight) >= n_inflight:
-                drain_one()
-
-        batch_imgs: list[np.ndarray] = []
-        batch_ts: list[float] = []
-
-        def submit_batch(ex: ThreadPoolExecutor) -> None:
-            if not batch_imgs:
-                return
-            arr = np.stack(batch_imgs, axis=0)
-            ts_arr = np.asarray(batch_ts, dtype=np.float32)
-            maybe_drain()
-            inflight.append((ex.submit(fe.encode, arr), ts_arr, 0))
-            if cfg.mirror:
-                arr_m = arr[:, :, ::-1, :].copy()     # numpy flip — in-RAM, no extra disk
-                maybe_drain()
-                inflight.append((ex.submit(fe.encode, arr_m), ts_arr, 1))
-            batch_imgs.clear()
-            batch_ts.clear()
-
-        if cfg.keyframes_only:
-            frame_iter = frames.iter_keyframes(
-                path, size=cfg.frame_size, crop=crop_filter,
-                min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
-                crops_out=crops_seen if collect_crops else None,
-            )
-        else:
-            frame_iter = frames.iter_frames(
-                path, fps=cfg.fps, size=cfg.frame_size, crop=crop_filter,
-                min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
-            )
-
-        try:
-            with ThreadPoolExecutor(max_workers=n_inflight) as ex:
-                for t, img in frame_iter:
-                    batch_imgs.append(img)
-                    batch_ts.append(t)
-                    if len(batch_imgs) >= cfg.batch_size:
-                        submit_batch(ex)
-                submit_batch(ex)
-                while drain_one():
-                    pass
-        except frames.FFmpegError as e:
-            console.print(f"[red]skip[/red] {path.name}: {e}")
-            return None
-        except Exception as e:
-            console.print(f"[red]encode error[/red] {path.name}: {e}")
-            return None
-
-        return collected, crops_seen
-
-    # First pass.
-    inline_crop_mode = bool(cfg.keyframes_only and getattr(cfg, "cropdetect", True))
-    legacy_pre_crop = (
+    inline_crop_mode = cfg.keyframes_only and getattr(cfg, "cropdetect", True)
+    legacy_crop = (
         frames.detect_crop(path)
         if (not cfg.keyframes_only and getattr(cfg, "cropdetect", True))
         else None
     )
+    crops_seen: list[tuple[int, int, int, int]] = []
 
-    result = _decode_pass(legacy_pre_crop, collect_crops=inline_crop_mode)
-    if result is None:
+    def _one_pass(crop_filter: str | None, collect_crops: bool):
+        batches: list[tuple[np.ndarray, np.ndarray]] = []
+        batch_imgs: list[np.ndarray] = []
+        batch_ts: list[float] = []
+        try:
+            if cfg.keyframes_only:
+                it = frames.iter_keyframes(
+                    path, size=cfg.frame_size, crop=crop_filter,
+                    min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+                    crops_out=crops_seen if collect_crops else None,
+                )
+            else:
+                it = frames.iter_frames(
+                    path, fps=cfg.fps, size=cfg.frame_size, crop=crop_filter,
+                    min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+                )
+            for t, img in it:
+                batch_imgs.append(img)
+                batch_ts.append(t)
+                if len(batch_imgs) >= cfg.batch_size:
+                    batches.append((np.stack(batch_imgs), np.asarray(batch_ts, dtype=np.float32)))
+                    batch_imgs, batch_ts = [], []
+            if batch_imgs:
+                batches.append((np.stack(batch_imgs), np.asarray(batch_ts, dtype=np.float32)))
+        except frames.FFmpegError as e:
+            console.print(f"[red]skip[/red] {path.name}: {e}")
+            return None
+        return batches
+
+    pass1 = _one_pass(legacy_crop, inline_crop_mode)
+    if pass1 is None:
         return None
-    collected, crops_seen = result
 
-    # If inline cropdetect picked up a real letterbox, re-decode with crop applied.
     if inline_crop_mode and crops_seen:
         agg = frames.aggregate_crop(crops_seen, info.width, info.height)
         if agg and frames.is_significant_crop(agg, info.width, info.height):
             crop_str = f"crop={agg[0]}:{agg[1]}:{agg[2]}:{agg[3]}"
             console.print(f"[dim]re-decode with {crop_str} → {path.name[:60]}[/dim]")
-            second = _decode_pass(crop_str, collect_crops=False)
-            if second is not None and second[0]:
-                collected = second[0]
+            crops_seen.clear()
+            pass2 = _one_pass(crop_str, False)
+            if pass2 is not None and pass2:
+                pass1 = pass2
 
-    if not collected:
-        return None
-    vectors = np.concatenate([c[0] for c in collected], axis=0)
-    timestamps = np.concatenate([c[1] for c in collected], axis=0)
-    mirror_flags = np.concatenate(
-        [np.full(len(c[0]), c[2], dtype=np.int8) for c in collected],
-        axis=0,
-    )
-    return vectors, timestamps, mirror_flags, info
+    return pass1
 
 
 def index_paths(paths: list[Path], cfg: Config, store: Store, fe: FeatureExtractor) -> int:
+    """Async pipeline: serial ffmpeg, parallel encoder/network.
+
+    A single ffmpeg runs at any given time (avoids HDD thrashing); as soon as
+    one video's frames are gathered we kick off the next ffmpeg, while the
+    previous video's batches keep travelling through the encoder pool. The
+    encoder semaphore enforces back-pressure so RAM doesn't grow without
+    bound when the network is the bottleneck.
+    """
+    indexer = AsyncIndexer(store, fe, cfg)
     added = 0
-    for path in tqdm(paths, desc="Indexing", unit="vid"):
-        sha1 = file_sha1(path)
-        if store.has_video(path, sha1):
+    pbar = tqdm(paths, desc="Indexing", unit="vid")
+    for path in pbar:
+        try:
+            sha1 = file_sha1(path)
+            if store.has_video(path, sha1):
+                continue
+            try:
+                info = frames.probe(path)
+            except frames.FFmpegError as e:
+                console.print(f"[red]skip[/red] {path.name}: {e}")
+                continue
+
+            batches = _decode_video_to_batches(path, cfg, info)
+            if not batches:
+                continue
+
+            with indexer.store_lock:
+                store.init_index(fe.dim)
+                video_id = store.add_video(
+                    path, sha1, info.duration, info.width, info.height, 0,
+                )
+            indexer.register(video_id)
+
+            n_submitted = 0
+            for arr, ts in batches:
+                indexer.submit_batch(video_id, arr, ts, 0)
+                n_submitted += 1
+                if cfg.mirror:
+                    arr_m = arr[:, :, ::-1, :].copy()
+                    indexer.submit_batch(video_id, arr_m, ts, 1)
+                    n_submitted += 1
+            indexer.mark_decoded(video_id, n_submitted)
+            added += 1
+        except Exception as e:
+            console.print(f"[red]unexpected error[/red] {path.name}: {e}")
             continue
-        result = _encode_video(path, fe, cfg)
-        if result is None:
-            continue
-        vectors, timestamps, mirror_flags, info = result
-        store.init_index(fe.dim)
-        n_frames = int((mirror_flags == 0).sum())
-        vid = store.add_video(path, sha1, info.duration, info.width, info.height, n_frames)
-        store.add_vectors(vectors, vid, timestamps, mirror_flags)
-        added += 1
-        store.save()
+
+    indexer.wait_all()
     return added
 
 

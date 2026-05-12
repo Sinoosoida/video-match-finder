@@ -58,7 +58,10 @@ class Store:
     def __init__(self, data_dir: Path, dim: int | None = None):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.data_dir / "videos.db")
+        # check_same_thread=False: the async indexer finalises videos from
+        # worker threads; AsyncIndexer.store_lock serialises writes so this
+        # is safe.
+        self.db = sqlite3.connect(self.data_dir / "videos.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
         self.db.commit()
 
@@ -119,6 +122,10 @@ class Store:
         )
         self.db.commit()
         return int(cur.lastrowid)
+
+    def update_n_frames(self, video_id: int, n_frames: int) -> None:
+        self.db.execute("UPDATE videos SET n_frames=? WHERE id=?", (n_frames, video_id))
+        self.db.commit()
 
     def list_videos(self) -> list[VideoRow]:
         rows = self.db.execute("SELECT id, path, duration, n_frames FROM videos ORDER BY id").fetchall()
