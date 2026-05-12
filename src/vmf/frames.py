@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -71,37 +73,7 @@ def detect_crop(path: Path, sample_seconds: float = 30.0) -> str | None:
     return f"crop={w}:{h}:{x}:{y}"
 
 
-def list_keyframe_pts(path: Path) -> list[float]:
-    """Enumerate the timestamp (seconds) of every keyframe in the video.
-
-    Used by `iter_keyframes` to assign real PTS to each decoded I-frame.
-    Returns [] on failure; the caller should fall back to uniform sampling.
-    """
-    cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "packet=pts_time,flags",
-        "-of", "csv=p=0", str(path),
-    ]
-    try:
-        out = subprocess.check_output(cmd, text=True, timeout=120)
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return []
-    pts: list[float] = []
-    for line in out.splitlines():
-        parts = line.split(",")
-        if len(parts) < 2:
-            continue
-        flags = parts[1]
-        if "K" not in flags:        # ffprobe marks keyframes with 'K' in flags
-            continue
-        pts_str = parts[0]
-        if not pts_str or pts_str == "N/A":
-            continue
-        try:
-            pts.append(float(pts_str))
-        except ValueError:
-            continue
-    return pts
+_SHOWINFO_PTS_RE = re.compile(r"pts_time:\s*([\-\d.eE+]+)")
 
 
 def iter_keyframes(
@@ -114,35 +86,54 @@ def iter_keyframes(
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Decode only keyframes (I-frames) — ~30–60× less CPU than full decode.
 
-    Timestamps come from `list_keyframe_pts` (ffprobe), so they're real PTS
-    even though the spacing is irregular. The downstream algorithm (Hough +
-    permutation) handles non-uniform t natively.
+    Timestamps come from ffmpeg's `showinfo` filter, parsed concurrently from
+    stderr in a worker thread. This avoids a separate ffprobe pass (which on
+    slow HDDs doubles the disk I/O per video), so each file is read exactly
+    once. The downstream algorithm (Hough + permutation) handles non-uniform
+    timestamps natively.
     """
-    pts_list = list_keyframe_pts(path)
-    if not pts_list:
-        return
-
     vf = []
     if crop:
         vf.append(crop)
+    vf.append("showinfo")                      # logs `pts_time:…` per output frame to stderr
     vf.append(f"scale={size}:{size}:force_original_aspect_ratio=decrease")
     vf.append(f"pad={size}:{size}:(ow-iw)/2:(oh-ih)/2:color=black")
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]   # info level needed for showinfo
     if hwaccel and _hwaccel_available():
         cmd += ["-hwaccel", "cuda"]
     cmd += [
         "-skip_frame", "nokey",
         "-i", str(path),
-        # -fps_mode passthrough is the modern name (ffmpeg ≥5.0); the legacy
-        # -vsync passthrough still works in 5/6 but is removed in 7+. Either
-        # way the intent is: keep decoded frames as-is, no duplication, no drop.
+        # -fps_mode passthrough keeps frames as-is (no duplication, no drop);
+        # available since ffmpeg 5.0, replaces deprecated -vsync passthrough.
         "-fps_mode", "passthrough",
         "-vf", ",".join(vf),
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
-    assert proc.stdout is not None
+    assert proc.stdout is not None and proc.stderr is not None
+
+    # Stream timestamps off stderr concurrently while we read frames off stdout.
+    pts_buf: list[float] = []
+    pts_done = threading.Event()
+
+    def _reader() -> None:
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                if b"showinfo" not in raw:
+                    continue
+                m = _SHOWINFO_PTS_RE.search(raw.decode("utf-8", "ignore"))
+                if m:
+                    try:
+                        pts_buf.append(float(m.group(1)))
+                    except ValueError:
+                        pass
+        finally:
+            pts_done.set()
+
+    threading.Thread(target=_reader, daemon=True).start()
+
     frame_bytes = size * size * 3
     idx = 0
     try:
@@ -150,21 +141,31 @@ def iter_keyframes(
             buf = proc.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
-            if idx >= len(pts_list):
-                break    # ffmpeg produced more frames than ffprobe enumerated; bail safely
             arr = np.frombuffer(buf, dtype=np.uint8).reshape(size, size, 3)
-            t = pts_list[idx]
+            # showinfo line for this frame usually arrives just before the raw
+            # bytes; spin briefly waiting if not.
+            spin = 0
+            while len(pts_buf) <= idx and not pts_done.is_set() and spin < 200:
+                time.sleep(0.005)
+                spin += 1
+            if len(pts_buf) > idx:
+                t = pts_buf[idx]
+            else:
+                # stderr lagged or filter quirk — fall back to monotonic index
+                t = float(idx) * 2.0
             idx += 1
             if min_std > 0.0 and float(arr.std()) < min_std:
                 continue
             yield t, arr
     finally:
         proc.stdout.close()
-        proc.wait(timeout=5)
-        if proc.returncode not in (0, None):
-            err = (proc.stderr.read().decode("utf-8", "ignore") if proc.stderr else "")
-            if idx == 0:
-                raise FFmpegError(f"ffmpeg failed for {path}: {err.strip()}")
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        if proc.returncode not in (0, None) and idx == 0:
+            err = proc.stderr.read().decode("utf-8", "ignore") if proc.stderr else ""
+            raise FFmpegError(f"ffmpeg failed for {path}: {err.strip()}")
 
 
 _HW_PROBED: bool | None = None
