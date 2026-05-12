@@ -96,14 +96,13 @@ API_KEY_OPT = typer.Option(
 INFLIGHT_OPT = typer.Option(
     None, "--inflight",
     help="Encode batches kept in flight at once. Raise for high-RTT links "
-         "(rule of thumb: bandwidth × RTT / batch_size). Default: 8.",
+         "(rule of thumb: bandwidth × RTT / batch_size). Default: 4.",
 )
 BATCH_SIZE_OPT = typer.Option(
     None, "--batch-size",
-    help="Frames per HTTP request. Larger batches keep the TCP window warm "
-         "and amortise per-request slow-start. Useful when uploading through "
-         "SSH tunnels or high-RTT networks. Default: 32. Try 128 or 256 if "
-         "the channel is under-utilised.",
+    help="Frames per HTTP request. Larger batches amortise the per-request "
+         "RTT floor; smaller batches keep server-side GPU latency low. "
+         "Default: 64 (sweet spot on a ~300 ms SSH-tunnel link).",
 )
 KEYFRAMES_ONLY_OPT = typer.Option(
     False, "--keyframes-only",

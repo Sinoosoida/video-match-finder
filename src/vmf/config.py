@@ -24,15 +24,18 @@ class Config:
                                       # uniform collections without letterbox to save time.
     frame_size: int = 224
     model: str = "auto"               # auto | dinov2_vits14 | dinov2_vitb14
-    batch_size: int = 32
+    batch_size: int = 64              # sweet spot on a high-RTT (~300 ms) SSH-tunnel link:
+                                      # small enough to keep one request well under a second
+                                      # of server-side compute, large enough to amortise the
+                                      # per-request RTT floor. Empirically batch=64 × inflight=4
+                                      # gave ~70 fps vs ~50 fps for batch=32 × inflight=4 on our
+                                      # nas→vast setup (see bench_batch.py). Doubling again to
+                                      # 128 starts losing to server-side GPU serial processing.
     # encode_inflight controls how many batches we keep in flight while ffmpeg
-    # keeps decoding the next ones. Bandwidth-delay product says we need
-    # roughly RTT / per-batch-time concurrent requests to saturate a fat pipe.
-    # The default 8 hides RTTs up to ~1 s when the server itself processes a
-    # batch in ~100–300 ms, so the bottleneck shifts to either ffmpeg-on-client
-    # or model-on-server rather than the network round-trip. Memory cost is
-    # minimal: ~5 MB of decoded frames per inflight slot.
-    encode_inflight: int = 8
+    # keeps decoding the next ones. With batch=64, four in-flight requests
+    # already cover the RTT × bandwidth product on our SSH-tunnel link; more
+    # than that piles work on a single-GPU server and hurts wall-clock.
+    encode_inflight: int = 4
     knn: int = 10
     min_pair_matches: int = 20        # ↑ from 15 — at fps=2 noise clouds are denser too
     ransac_iters: int = 10_000        # exhaustive search — finds faint real lines reliably
