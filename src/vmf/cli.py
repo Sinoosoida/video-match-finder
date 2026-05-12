@@ -38,6 +38,7 @@ def _make_config(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     inflight: Optional[int] = None,
+    batch_size: Optional[int] = None,
     keyframes_only: bool = False,
     no_cropdetect: bool = False,
 ) -> Config:
@@ -50,6 +51,8 @@ def _make_config(
         cfg.api_key = api_key
     if inflight is not None and inflight >= 1:
         cfg.encode_inflight = inflight
+    if batch_size is not None and batch_size >= 1:
+        cfg.batch_size = batch_size
     if keyframes_only:
         cfg.keyframes_only = True
     if no_cropdetect:
@@ -95,6 +98,13 @@ INFLIGHT_OPT = typer.Option(
     help="Encode batches kept in flight at once. Raise for high-RTT links "
          "(rule of thumb: bandwidth × RTT / batch_size). Default: 8.",
 )
+BATCH_SIZE_OPT = typer.Option(
+    None, "--batch-size",
+    help="Frames per HTTP request. Larger batches keep the TCP window warm "
+         "and amortise per-request slow-start. Useful when uploading through "
+         "SSH tunnels or high-RTT networks. Default: 32. Try 128 or 256 if "
+         "the channel is under-utilised.",
+)
 KEYFRAMES_ONLY_OPT = typer.Option(
     False, "--keyframes-only",
     help="Decode only I-frames. 30–60× less CPU than uniform fps sampling; "
@@ -131,12 +141,14 @@ def index(
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
     inflight: Optional[int] = INFLIGHT_OPT,
+    batch_size: Optional[int] = BATCH_SIZE_OPT,
     keyframes_only: bool = KEYFRAMES_ONLY_OPT,
     no_cropdetect: bool = NO_CROPDETECT_OPT,
 ) -> None:
     """Add videos to the index without searching."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror,
                        endpoint=endpoint, api_key=api_key, inflight=inflight,
+                       batch_size=batch_size,
                        keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     videos = discover_videos(paths)
     if not videos:
@@ -161,6 +173,7 @@ def scan(
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
     inflight: Optional[int] = INFLIGHT_OPT,
+    batch_size: Optional[int] = BATCH_SIZE_OPT,
     keyframes_only: bool = KEYFRAMES_ONLY_OPT,
     no_cropdetect: bool = NO_CROPDETECT_OPT,
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write JSON results to this file."),
@@ -168,6 +181,7 @@ def scan(
     """Index a collection (if not already) and report overlapping pairs."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror, legacy_ransac,
                        endpoint=endpoint, api_key=api_key, inflight=inflight,
+                       batch_size=batch_size,
                        keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     videos = discover_videos(paths)
     if not videos:
@@ -196,6 +210,7 @@ def find(
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
     inflight: Optional[int] = INFLIGHT_OPT,
+    batch_size: Optional[int] = BATCH_SIZE_OPT,
     keyframes_only: bool = KEYFRAMES_ONLY_OPT,
     no_cropdetect: bool = NO_CROPDETECT_OPT,
     json_out: Optional[Path] = typer.Option(None, "--json"),
@@ -203,6 +218,7 @@ def find(
     """Search the existing index for matches against a single query video."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror,
                        endpoint=endpoint, api_key=api_key, inflight=inflight,
+                       batch_size=batch_size,
                        keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     store = Store(cfg.data_dir)
     if store.index is None or store.index.ntotal == 0:
