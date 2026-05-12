@@ -76,6 +76,44 @@ def detect_crop(path: Path, sample_seconds: float = 30.0) -> str | None:
 _SHOWINFO_PTS_RE = re.compile(r"pts_time:\s*([\-\d.eE+]+)")
 
 
+def aggregate_crop(
+    crops: list[tuple[int, int, int, int]],
+    src_w: int, src_h: int,
+) -> tuple[int, int, int, int] | None:
+    """Robust per-video crop from a list of per-frame cropdetect outputs.
+
+    Filters out clearly degenerate frames (where detected content is <50% of
+    the source area — usually fade/intro frames where cropdetect couldn't
+    find borders), then takes the median across the 4 coordinates. Median
+    is resilient to outliers from noisy frames (stray bright pixels, fades,
+    transient overlays).
+    """
+    if not crops:
+        return None
+    import numpy as _np
+    arr = _np.asarray(crops, dtype=_np.int64)        # (N, 4): W, H, X, Y
+    src_area = src_w * src_h
+    if src_area <= 0:
+        return None
+    area = arr[:, 0] * arr[:, 1]
+    keep = area >= 0.5 * src_area
+    if keep.sum() < 1:                               # need at least one trustworthy frame
+        return None
+    arr = arr[keep]
+    return (int(_np.median(arr[:, 0])), int(_np.median(arr[:, 1])),
+            int(_np.median(arr[:, 2])), int(_np.median(arr[:, 3])))
+
+
+def is_significant_crop(
+    crop: tuple[int, int, int, int],
+    src_w: int, src_h: int,
+    tolerance: float = 0.97,
+) -> bool:
+    """True if applying this crop would meaningfully shrink the frame."""
+    w, h, _x, _y = crop
+    return w < tolerance * src_w or h < tolerance * src_h
+
+
 def iter_keyframes(
     path: Path,
     size: int,
@@ -83,6 +121,7 @@ def iter_keyframes(
     *,
     min_std: float = 0.0,
     hwaccel: bool = False,
+    crops_out: list[tuple[int, int, int, int]] | None = None,
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Decode only keyframes (I-frames) — ~30–60× less CPU than full decode.
 
@@ -91,10 +130,21 @@ def iter_keyframes(
     slow HDDs doubles the disk I/O per video), so each file is read exactly
     once. The downstream algorithm (Hough + permutation) handles non-uniform
     timestamps natively.
+
+    If `crops_out` is supplied (and `crop` is not), `cropdetect` is added to
+    the filter chain at source-resolution. Per-frame `(W, H, X, Y)` tuples are
+    appended; the caller can aggregate them after iteration to decide whether
+    a second pass with crop pre-applied is warranted.
     """
     vf = []
     if crop:
         vf.append(crop)
+    if crops_out is not None and crop is None:
+        # cropdetect must run BEFORE scale (it analyses border darkness at
+        # source resolution). reset_count=1 → one detection per frame, not
+        # cumulative. Passthrough: frames continue unmodified to the next
+        # filter, so we get the crop info "for free" along the same pass.
+        vf.append("cropdetect=limit=24:round=2:reset_count=1")
     vf.append("showinfo")                      # logs `pts_time:…` per output frame to stderr
     vf.append(f"scale={size}:{size}:force_original_aspect_ratio=decrease")
     vf.append(f"pad={size}:{size}:(ow-iw)/2:(oh-ih)/2:color=black")
@@ -121,14 +171,21 @@ def iter_keyframes(
     def _reader() -> None:
         try:
             for raw in iter(proc.stderr.readline, b""):
-                if b"showinfo" not in raw:
-                    continue
-                m = _SHOWINFO_PTS_RE.search(raw.decode("utf-8", "ignore"))
-                if m:
-                    try:
-                        pts_buf.append(float(m.group(1)))
-                    except ValueError:
-                        pass
+                if b"showinfo" in raw:
+                    m = _SHOWINFO_PTS_RE.search(raw.decode("utf-8", "ignore"))
+                    if m:
+                        try:
+                            pts_buf.append(float(m.group(1)))
+                        except ValueError:
+                            pass
+                if crops_out is not None and b"Parsed_cropdetect" in raw:
+                    m = _CROP_RE.search(raw.decode("utf-8", "ignore"))
+                    if m:
+                        try:
+                            crops_out.append((int(m.group(1)), int(m.group(2)),
+                                              int(m.group(3)), int(m.group(4))))
+                        except ValueError:
+                            pass
         finally:
             pts_done.set()
 

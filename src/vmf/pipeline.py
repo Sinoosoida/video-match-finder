@@ -47,6 +47,15 @@ def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
     and blocks only when `encode_inflight` jobs are already in flight,
     keeping ffmpeg, JPEG-encode, network/IO, and the GPU (or remote GPU)
     overlapped end-to-end without buffering an entire video in RAM.
+
+    Crop handling:
+      * keyframes_only + cropdetect: cropdetect runs inline in the same
+        ffmpeg pass (free — passthrough filter). We collect per-frame crop
+        coordinates from stderr, aggregate via median, and only re-decode if
+        a meaningful letterbox was found. So 99 % of videos cost one disk
+        read; the 1 % with real letterbox cost two.
+      * uniform-fps + cropdetect: a separate cropdetect pre-pass runs first
+        (cheap with -skip_frame nokey but still a small disk hit).
     """
     try:
         info = frames.probe(path)
@@ -54,71 +63,99 @@ def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
         console.print(f"[red]skip[/red] {path.name}: {e}")
         return None
 
-    crop = frames.detect_crop(path) if getattr(cfg, "cropdetect", True) else None
     n_inflight = max(1, getattr(cfg, "encode_inflight", 2))
 
-    # Each collected chunk is (vecs, ts, mirror_flag). Ordering is irrelevant
-    # because per-vector (video_id, ts, mirrored) metadata travels with it.
-    collected: list[tuple[np.ndarray, np.ndarray, int]] = []
-    inflight: list[tuple[Future, np.ndarray, int]] = []
+    def _decode_pass(
+        crop_filter: str | None,
+        collect_crops: bool,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], list[tuple[int, int, int, int]]] | None:
+        """Run one full decode → encode → buffer pass. Returns (collected, crops_seen)."""
+        collected: list[tuple[np.ndarray, np.ndarray, int]] = []
+        inflight: list[tuple[Future, np.ndarray, int]] = []
+        crops_seen: list[tuple[int, int, int, int]] = []
 
-    def drain_one() -> bool:
-        if not inflight:
-            return False
-        fut, ts, mflag = inflight.pop(0)
+        def drain_one() -> bool:
+            if not inflight:
+                return False
+            fut, ts, mflag = inflight.pop(0)
+            v = fut.result()                          # may raise; propagated to caller
+            collected.append((v, ts, mflag))
+            return True
+
+        def maybe_drain() -> None:
+            while len(inflight) >= n_inflight:
+                drain_one()
+
+        batch_imgs: list[np.ndarray] = []
+        batch_ts: list[float] = []
+
+        def submit_batch(ex: ThreadPoolExecutor) -> None:
+            if not batch_imgs:
+                return
+            arr = np.stack(batch_imgs, axis=0)
+            ts_arr = np.asarray(batch_ts, dtype=np.float32)
+            maybe_drain()
+            inflight.append((ex.submit(fe.encode, arr), ts_arr, 0))
+            if cfg.mirror:
+                arr_m = arr[:, :, ::-1, :].copy()     # numpy flip — in-RAM, no extra disk
+                maybe_drain()
+                inflight.append((ex.submit(fe.encode, arr_m), ts_arr, 1))
+            batch_imgs.clear()
+            batch_ts.clear()
+
+        if cfg.keyframes_only:
+            frame_iter = frames.iter_keyframes(
+                path, size=cfg.frame_size, crop=crop_filter,
+                min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+                crops_out=crops_seen if collect_crops else None,
+            )
+        else:
+            frame_iter = frames.iter_frames(
+                path, fps=cfg.fps, size=cfg.frame_size, crop=crop_filter,
+                min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+            )
+
         try:
-            v = fut.result()
+            with ThreadPoolExecutor(max_workers=n_inflight) as ex:
+                for t, img in frame_iter:
+                    batch_imgs.append(img)
+                    batch_ts.append(t)
+                    if len(batch_imgs) >= cfg.batch_size:
+                        submit_batch(ex)
+                submit_batch(ex)
+                while drain_one():
+                    pass
+        except frames.FFmpegError as e:
+            console.print(f"[red]skip[/red] {path.name}: {e}")
+            return None
         except Exception as e:
             console.print(f"[red]encode error[/red] {path.name}: {e}")
-            raise
-        collected.append((v, ts, mflag))
-        return True
+            return None
 
-    def maybe_drain() -> None:
-        while len(inflight) >= n_inflight:
-            drain_one()
+        return collected, crops_seen
 
-    batch_imgs: list[np.ndarray] = []
-    batch_ts: list[float] = []
+    # First pass.
+    inline_crop_mode = bool(cfg.keyframes_only and getattr(cfg, "cropdetect", True))
+    legacy_pre_crop = (
+        frames.detect_crop(path)
+        if (not cfg.keyframes_only and getattr(cfg, "cropdetect", True))
+        else None
+    )
 
-    def submit_batch(ex: ThreadPoolExecutor) -> None:
-        if not batch_imgs:
-            return
-        arr = np.stack(batch_imgs, axis=0)
-        ts_arr = np.asarray(batch_ts, dtype=np.float32)
-        maybe_drain()
-        inflight.append((ex.submit(fe.encode, arr), ts_arr, 0))
-        if cfg.mirror:
-            arr_m = arr[:, :, ::-1, :].copy()
-            maybe_drain()
-            inflight.append((ex.submit(fe.encode, arr_m), ts_arr, 1))
-        batch_imgs.clear()
-        batch_ts.clear()
-
-    if cfg.keyframes_only:
-        frame_iter = frames.iter_keyframes(
-            path, size=cfg.frame_size, crop=crop,
-            min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
-        )
-    else:
-        frame_iter = frames.iter_frames(
-            path, fps=cfg.fps, size=cfg.frame_size, crop=crop,
-            min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
-        )
-
-    try:
-        with ThreadPoolExecutor(max_workers=n_inflight) as ex:
-            for t, img in frame_iter:
-                batch_imgs.append(img)
-                batch_ts.append(t)
-                if len(batch_imgs) >= cfg.batch_size:
-                    submit_batch(ex)
-            submit_batch(ex)
-            while drain_one():
-                pass
-    except frames.FFmpegError as e:
-        console.print(f"[red]skip[/red] {path.name}: {e}")
+    result = _decode_pass(legacy_pre_crop, collect_crops=inline_crop_mode)
+    if result is None:
         return None
+    collected, crops_seen = result
+
+    # If inline cropdetect picked up a real letterbox, re-decode with crop applied.
+    if inline_crop_mode and crops_seen:
+        agg = frames.aggregate_crop(crops_seen, info.width, info.height)
+        if agg and frames.is_significant_crop(agg, info.width, info.height):
+            crop_str = f"crop={agg[0]}:{agg[1]}:{agg[2]}:{agg[3]}"
+            console.print(f"[dim]re-decode with {crop_str} → {path.name[:60]}[/dim]")
+            second = _decode_pass(crop_str, collect_crops=False)
+            if second is not None and second[0]:
+                collected = second[0]
 
     if not collected:
         return None
