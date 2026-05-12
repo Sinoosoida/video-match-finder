@@ -48,9 +48,16 @@ _CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 
 
 def detect_crop(path: Path, sample_seconds: float = 30.0) -> str | None:
-    """Return ffmpeg `crop=W:H:X:Y` string if non-trivial letterbox detected."""
+    """Return ffmpeg `crop=W:H:X:Y` string if non-trivial letterbox detected.
+
+    Uses `-skip_frame nokey` so only keyframes are decoded — letterbox borders
+    are structural and visible on every frame, so I-frames are enough and the
+    pre-pass is ~10× cheaper than full decode.
+    """
     cmd = [
-        "ffmpeg", "-hide_banner", "-nostats", "-ss", "0", "-t", str(sample_seconds),
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-skip_frame", "nokey",
+        "-ss", "0", "-t", str(sample_seconds),
         "-i", str(path), "-vf", "cropdetect=24:16:0", "-f", "null", "-",
     ]
     try:
@@ -62,6 +69,99 @@ def detect_crop(path: Path, sample_seconds: float = 30.0) -> str | None:
         return None
     w, h, x, y = matches[-1]
     return f"crop={w}:{h}:{x}:{y}"
+
+
+def list_keyframe_pts(path: Path) -> list[float]:
+    """Enumerate the timestamp (seconds) of every keyframe in the video.
+
+    Used by `iter_keyframes` to assign real PTS to each decoded I-frame.
+    Returns [] on failure; the caller should fall back to uniform sampling.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,flags",
+        "-of", "csv=p=0", str(path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, text=True, timeout=120)
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+    pts: list[float] = []
+    for line in out.splitlines():
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        flags = parts[1]
+        if "K" not in flags:        # ffprobe marks keyframes with 'K' in flags
+            continue
+        pts_str = parts[0]
+        if not pts_str or pts_str == "N/A":
+            continue
+        try:
+            pts.append(float(pts_str))
+        except ValueError:
+            continue
+    return pts
+
+
+def iter_keyframes(
+    path: Path,
+    size: int,
+    crop: str | None = None,
+    *,
+    min_std: float = 0.0,
+    hwaccel: bool = False,
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Decode only keyframes (I-frames) — ~30–60× less CPU than full decode.
+
+    Timestamps come from `list_keyframe_pts` (ffprobe), so they're real PTS
+    even though the spacing is irregular. The downstream algorithm (Hough +
+    permutation) handles non-uniform t natively.
+    """
+    pts_list = list_keyframe_pts(path)
+    if not pts_list:
+        return
+
+    vf = []
+    if crop:
+        vf.append(crop)
+    vf.append(f"scale={size}:{size}:force_original_aspect_ratio=decrease")
+    vf.append(f"pad={size}:{size}:(ow-iw)/2:(oh-ih)/2:color=black")
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    if hwaccel and _hwaccel_available():
+        cmd += ["-hwaccel", "cuda"]
+    cmd += [
+        "-skip_frame", "nokey",
+        "-i", str(path),
+        "-vsync", "passthrough",     # keep ffmpeg from de-duplicating or padding frames
+        "-vf", ",".join(vf),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+    assert proc.stdout is not None
+    frame_bytes = size * size * 3
+    idx = 0
+    try:
+        while True:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            if idx >= len(pts_list):
+                break    # ffmpeg produced more frames than ffprobe enumerated; bail safely
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(size, size, 3)
+            t = pts_list[idx]
+            idx += 1
+            if min_std > 0.0 and float(arr.std()) < min_std:
+                continue
+            yield t, arr
+    finally:
+        proc.stdout.close()
+        proc.wait(timeout=5)
+        if proc.returncode not in (0, None):
+            err = (proc.stderr.read().decode("utf-8", "ignore") if proc.stderr else "")
+            if idx == 0:
+                raise FFmpegError(f"ffmpeg failed for {path}: {err.strip()}")
 
 
 _HW_PROBED: bool | None = None

@@ -19,6 +19,9 @@ def default_data_dir() -> Path:
 class Config:
     data_dir: Path = field(default_factory=default_data_dir)
     fps: float = 2.0                  # 2 samples/sec — 0.5s grid, good recall/cost balance
+    keyframes_only: bool = False      # decode only I-frames; 30–60× less CPU on H.264
+    cropdetect: bool = True           # run cropdetect pre-pass (~1–3s/video). Disable on
+                                      # uniform collections without letterbox to save time.
     frame_size: int = 224
     model: str = "auto"               # auto | dinov2_vits14 | dinov2_vitb14
     batch_size: int = 32

@@ -38,6 +38,8 @@ def _make_config(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     inflight: Optional[int] = None,
+    keyframes_only: bool = False,
+    no_cropdetect: bool = False,
 ) -> Config:
     cfg = Config()
     if legacy_ransac:
@@ -48,6 +50,10 @@ def _make_config(
         cfg.api_key = api_key
     if inflight is not None and inflight >= 1:
         cfg.encode_inflight = inflight
+    if keyframes_only:
+        cfg.keyframes_only = True
+    if no_cropdetect:
+        cfg.cropdetect = False
     if data_dir is not None:
         cfg.data_dir = data_dir
     if fps is not None:
@@ -89,6 +95,16 @@ INFLIGHT_OPT = typer.Option(
     help="Encode batches kept in flight at once. Raise for high-RTT links "
          "(rule of thumb: bandwidth × RTT / batch_size). Default: 8.",
 )
+KEYFRAMES_ONLY_OPT = typer.Option(
+    False, "--keyframes-only",
+    help="Decode only I-frames. 30–60× less CPU than uniform fps sampling; "
+         "timestamps come from ffprobe so the algorithm still gets real PTS.",
+)
+NO_CROPDETECT_OPT = typer.Option(
+    False, "--no-cropdetect",
+    help="Skip the cropdetect pre-pass. Saves 1–3 seconds per video on "
+         "collections that don't have letterboxes.",
+)
 
 
 @app.callback()
@@ -115,10 +131,13 @@ def index(
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
     inflight: Optional[int] = INFLIGHT_OPT,
+    keyframes_only: bool = KEYFRAMES_ONLY_OPT,
+    no_cropdetect: bool = NO_CROPDETECT_OPT,
 ) -> None:
     """Add videos to the index without searching."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror,
-                       endpoint=endpoint, api_key=api_key, inflight=inflight)
+                       endpoint=endpoint, api_key=api_key, inflight=inflight,
+                       keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     videos = discover_videos(paths)
     if not videos:
         console.print("[yellow]No videos found.[/yellow]")
@@ -142,11 +161,14 @@ def scan(
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
     inflight: Optional[int] = INFLIGHT_OPT,
+    keyframes_only: bool = KEYFRAMES_ONLY_OPT,
+    no_cropdetect: bool = NO_CROPDETECT_OPT,
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write JSON results to this file."),
 ) -> None:
     """Index a collection (if not already) and report overlapping pairs."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror, legacy_ransac,
-                       endpoint=endpoint, api_key=api_key, inflight=inflight)
+                       endpoint=endpoint, api_key=api_key, inflight=inflight,
+                       keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     videos = discover_videos(paths)
     if not videos:
         console.print("[yellow]No videos found.[/yellow]")
@@ -174,11 +196,14 @@ def find(
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
     inflight: Optional[int] = INFLIGHT_OPT,
+    keyframes_only: bool = KEYFRAMES_ONLY_OPT,
+    no_cropdetect: bool = NO_CROPDETECT_OPT,
     json_out: Optional[Path] = typer.Option(None, "--json"),
 ) -> None:
     """Search the existing index for matches against a single query video."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror,
-                       endpoint=endpoint, api_key=api_key, inflight=inflight)
+                       endpoint=endpoint, api_key=api_key, inflight=inflight,
+                       keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     store = Store(cfg.data_dir)
     if store.index is None or store.index.ntotal == 0:
         console.print("[red]Index is empty. Run `vmf index` or `vmf scan` first.[/red]")

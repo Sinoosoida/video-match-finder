@@ -54,7 +54,7 @@ def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
         console.print(f"[red]skip[/red] {path.name}: {e}")
         return None
 
-    crop = frames.detect_crop(path)
+    crop = frames.detect_crop(path) if getattr(cfg, "cropdetect", True) else None
     n_inflight = max(1, getattr(cfg, "encode_inflight", 2))
 
     # Each collected chunk is (vecs, ts, mirror_flag). Ordering is irrelevant
@@ -95,12 +95,20 @@ def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
         batch_imgs.clear()
         batch_ts.clear()
 
+    if cfg.keyframes_only:
+        frame_iter = frames.iter_keyframes(
+            path, size=cfg.frame_size, crop=crop,
+            min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+        )
+    else:
+        frame_iter = frames.iter_frames(
+            path, fps=cfg.fps, size=cfg.frame_size, crop=crop,
+            min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+        )
+
     try:
         with ThreadPoolExecutor(max_workers=n_inflight) as ex:
-            for t, img in frames.iter_frames(
-                path, fps=cfg.fps, size=cfg.frame_size, crop=crop,
-                min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
-            ):
+            for t, img in frame_iter:
                 batch_imgs.append(img)
                 batch_ts.append(t)
                 if len(batch_imgs) >= cfg.batch_size:
