@@ -225,11 +225,18 @@ def serve(
 def doctor() -> None:
     """Diagnose the environment — Python, torch, GPU, ffmpeg — and suggest fixes."""
     import shutil
-    import torch as _torch
     import psutil
+    from vmf.torch_install import detect_plan
 
     console.print(f"[bold]Python[/bold]: {__import__('sys').version.split()[0]}")
-    console.print(f"[bold]torch[/bold]:  {_torch.__version__}")
+    try:
+        import torch as _torch
+        console.print(f"[bold]torch[/bold]:  {_torch.__version__}")
+        has_torch = True
+    except ImportError:
+        _torch = None
+        has_torch = False
+        console.print("[bold]torch[/bold]:  [red]not installed[/red]")
 
     ffmpeg = shutil.which("ffmpeg")
     console.print(f"[bold]ffmpeg[/bold]: {ffmpeg or '[red]not found[/red]'}")
@@ -237,14 +244,21 @@ def doctor() -> None:
     mem = psutil.virtual_memory()
     console.print(f"[bold]RAM[/bold]:    {mem.available/1e9:.1f} GB free of {mem.total/1e9:.1f} GB")
 
-    if not _torch.cuda.is_available():
-        console.print("[bold]GPU[/bold]:    no CUDA-capable PyTorch installed — CPU mode.")
+    plan = detect_plan()
+    console.print(f"[bold]GPU plan[/bold]: {plan.reason}")
+    if not has_torch:
         console.print(
-            "  • If you have a modern NVIDIA GPU and a recent driver, reinstall torch "
-            "from a CUDA channel, e.g.:\n"
-            "    [cyan]pip install --index-url https://download.pytorch.org/whl/cu124 "
-            "--force-reinstall torch torchvision[/cyan]"
+            "  Run [cyan]vmf install-torch[/cyan] to install the matching wheel."
         )
+        return
+
+    if not _torch.cuda.is_available():
+        console.print("[bold]GPU[/bold]:    PyTorch is CPU-only (no CUDA available).")
+        if plan.channel != "cpu":
+            console.print(
+                f"  Detected {plan.reason}. To enable GPU run "
+                f"[cyan]vmf install-torch --force[/cyan] (uses {plan.channel})."
+            )
         return
 
     name = _torch.cuda.get_device_name(0)
@@ -256,23 +270,53 @@ def doctor() -> None:
         console.print("[green]GPU kernels work — the package will use CUDA automatically.[/green]")
     except Exception as e:
         console.print(f"[red]GPU kernels fail:[/red] {type(e).__name__}: {e}")
-        cc_num = cc[0] * 10 + cc[1]
-        if cc_num < 70:
+        if plan.legacy:
             console.print(
-                f"  Your GPU's compute capability ({cc[0]}.{cc[1]}) is older than what "
-                "recent PyTorch wheels include kernels for (≥7.5). Options:\n"
-                "    1. Use CPU — recommended for this hardware, performance gain on this "
-                "GPU would be modest anyway.\n"
-                "    2. Install torch 2.1 with cu118 (still ships sm_61 kernels), but it "
-                "requires Python ≤3.11.\n"
-                "    3. Build PyTorch from source with [cyan]TORCH_CUDA_ARCH_LIST='"
-                f"{cc[0]}.{cc[1]}'[/cyan]."
+                f"  Compute capability {cc[0]}.{cc[1]} is too old for modern PyTorch "
+                "wheels. Either use CPU or install legacy torch (≤2.1 + cu118)."
             )
         else:
             console.print(
-                "  The installed torch CUDA build doesn't match this driver. "
-                "Try a different CUDA channel (cu121 / cu124 / cu128)."
+                f"  Installed torch CUDA build doesn't match the driver. "
+                f"Run [cyan]vmf install-torch --force[/cyan] to reinstall as {plan.channel}."
             )
+
+
+@app.command(name="install-torch")
+def install_torch(
+    force: bool = typer.Option(False, "--force",
+        help="Pass --force-reinstall to pip (use when torch is already installed)."),
+    dry_run: bool = typer.Option(False, "--dry-run",
+        help="Print the pip command without running it."),
+) -> None:
+    """Install torch + torchvision from the CUDA channel matching this host.
+
+    Inspects `nvidia-smi` to pick the right `--index-url` so a fresh install
+    doesn't silently grab a too-new CUDA wheel that fails at runtime.
+    """
+    from vmf.torch_install import detect_plan, install_command, run_install
+
+    plan = detect_plan()
+    console.print(f"[bold]Plan[/bold]: {plan.reason}")
+    if plan.legacy:
+        console.print(
+            "[red]Legacy GPU detected.[/red] Modern PyTorch wheels do not ship "
+            f"kernels for this hardware. Manual install required, e.g.:\n"
+            "  [cyan]pip install torch==2.1.2 torchvision==0.16.2 "
+            "--index-url https://download.pytorch.org/whl/cu118[/cyan]\n"
+            "(Python ≤ 3.11 only.)"
+        )
+        raise typer.Exit(1)
+
+    cmd = install_command(plan, force=force)
+    console.print(f"[cyan]Running:[/cyan] {' '.join(cmd)}")
+    if dry_run:
+        return
+    rc = run_install(plan, force=force)
+    if rc != 0:
+        console.print(f"[red]pip exited with code {rc}[/red]")
+        raise typer.Exit(rc)
+    console.print("[green]Done.[/green] Re-run [cyan]vmf doctor[/cyan] to verify.")
 
 
 @app.command()

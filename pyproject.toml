@@ -19,11 +19,12 @@ classifiers = [
 ]
 
 dependencies = [
-    # torch and torchvision are pulled in but kept flexible so the user can
-    # install the right CUDA build for their GPU (or stay on CPU).
-    # See the README for the recommended `--index-url` per CUDA version.
-    "torch>=2.4,<3",
-    "torchvision>=0.19,<1",
+    # torch and torchvision are intentionally NOT listed here. PyPI's default
+    # torch wheel is the newest CUDA build (currently cu130, requiring driver
+    # ≥ 580), which would silently upgrade and break installs on hosts with
+    # older drivers or pre-installed torch builds. Install torch separately
+    # (run `vmf install-torch` after this package for automatic detection),
+    # or pick a wheel manually from https://pytorch.org/get-started/locally/.
     "numpy>=1.24",
     "faiss-cpu>=1.7.4",
     "Pillow>=10.0",
@@ -35,6 +36,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Convenience extras. Most users should install torch separately to match
+# their CUDA / driver version (see `vmf install-torch`).
+torch-cpu = ["torch>=2.4", "torchvision>=0.19"]
 gpu = ["faiss-gpu>=1.7.4"]
 serve = ["fastapi>=0.110", "uvicorn>=0.29"]
 dev = ["pytest>=8", "ruff>=0.4"]

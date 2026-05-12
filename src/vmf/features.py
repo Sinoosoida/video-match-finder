@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import psutil
-import torch
 from rich.console import Console
+
+# torch is imported lazily so a client using --endpoint (RemoteFeatureExtractor
+# only) does not require a working torch install.
 
 console = Console(stderr=True)
 
@@ -16,8 +19,8 @@ MODEL_CATALOG = [
     ("dinov2_vitb14",   768,  340),
 ]
 
-MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 @dataclass
@@ -25,23 +28,27 @@ class FeatureExtractor:
     name: str
     dim: int
     device: str
-    model: torch.nn.Module
+    model: Any  # torch.nn.Module — typed as Any to keep torch import lazy
 
-    @torch.inference_mode()
     def encode(self, frames: np.ndarray) -> np.ndarray:
         """frames: (B, H, W, 3) uint8 → (B, dim) float32, L2-normalized."""
-        x = torch.from_numpy(frames).to(self.device, non_blocking=True)
-        x = x.permute(0, 3, 1, 2).float().div_(255.0)
-        x = (x - MEAN.to(self.device)) / STD.to(self.device)
-        feats = self.model(x)
-        feats = torch.nn.functional.normalize(feats, dim=-1)
-        return feats.detach().cpu().numpy().astype(np.float32)
+        import torch
+        with torch.inference_mode():
+            mean = torch.tensor(_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+            std = torch.tensor(_IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
+            x = torch.from_numpy(frames).to(self.device, non_blocking=True)
+            x = x.permute(0, 3, 1, 2).float().div_(255.0)
+            x = (x - mean) / std
+            feats = self.model(x)
+            feats = torch.nn.functional.normalize(feats, dim=-1)
+            return feats.detach().cpu().numpy().astype(np.float32)
 
 
 def _cuda_kernel_works() -> bool:
-    """`cuda.is_available()` can be True while the GPU's compute capability is
-    unsupported by the installed PyTorch wheel (common on Pascal/older). Probe
-    with a tiny op and treat kernel failures as 'unusable'."""
+    try:
+        import torch
+    except ImportError:
+        return False
     if not torch.cuda.is_available():
         return False
     try:
@@ -52,6 +59,14 @@ def _cuda_kernel_works() -> bool:
 
 
 def _resolve_device(pref: str) -> str:
+    try:
+        import torch
+    except ImportError as e:
+        raise RuntimeError(
+            "torch is not installed. Run `vmf install-torch` or `pip install "
+            "video-match-finder[torch-cpu]`. (Not needed when using --endpoint.)"
+        ) from e
+
     if pref == "cuda":
         if not _cuda_kernel_works():
             raise RuntimeError("CUDA requested but no usable GPU kernel — see `vmf doctor`.")
@@ -76,6 +91,7 @@ def _resolve_device(pref: str) -> str:
 
 def _available_memory_mb(device: str) -> float:
     if device == "cuda":
+        import torch
         free, _ = torch.cuda.mem_get_info()
         return free / (1024 * 1024)
     return psutil.virtual_memory().available / (1024 * 1024)
@@ -117,6 +133,7 @@ def _pick_model(requested: str, device: str) -> tuple[str, int]:
 
 
 def load_extractor(model: str = "auto", device: str = "auto") -> FeatureExtractor:
+    import torch
     dev = _resolve_device(device)
     name, dim = _pick_model(model, dev)
     console.print(f"[cyan]Loading {name} on {dev}…[/cyan]")
