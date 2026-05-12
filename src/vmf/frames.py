@@ -134,7 +134,10 @@ def iter_keyframes(
     cmd += [
         "-skip_frame", "nokey",
         "-i", str(path),
-        "-vsync", "passthrough",     # keep ffmpeg from de-duplicating or padding frames
+        # -fps_mode passthrough is the modern name (ffmpeg ≥5.0); the legacy
+        # -vsync passthrough still works in 5/6 but is removed in 7+. Either
+        # way the intent is: keep decoded frames as-is, no duplication, no drop.
+        "-fps_mode", "passthrough",
         "-vf", ",".join(vf),
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
