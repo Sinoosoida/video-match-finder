@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-match-finder"
+version = "0.1.0"
+description = "Find overlapping fragments across a video collection (partial near-duplicate detection)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "video-match-finder contributors" }]
+keywords = ["video", "near-duplicate", "copy-detection", "dinov2", "faiss"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    # torch and torchvision are pulled in but kept flexible so the user can
+    # install the right CUDA build for their GPU (or stay on CPU).
+    # See the README for the recommended `--index-url` per CUDA version.
+    "torch>=2.4,<3",
+    "torchvision>=0.19,<1",
+    "numpy>=1.24",
+    "faiss-cpu>=1.7.4",
+    "Pillow>=10.0",
+    "psutil>=5.9",
+    "typer>=0.12",
+    "rich>=13.7",
+    "tqdm>=4.66",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+gpu = ["faiss-gpu>=1.7.4"]
+serve = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[project.scripts]
+vmf = "vmf.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/sinoosoida/video-match-finder"
+Issues = "https://github.com/sinoosoida/video-match-finder/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
