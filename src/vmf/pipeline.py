@@ -40,15 +40,19 @@ def discover_videos(roots: Iterable[Path]) -> list[Path]:
     return sorted(set(out))
 
 
-def _decode_video_to_batches(
+def _decode_and_submit(
     path: Path, cfg: Config, info: "frames.VideoInfo",
-) -> list[tuple[np.ndarray, np.ndarray]] | None:
-    """Decode one video to a list of (frame_batch, timestamps) batches.
+    indexer, video_id: int,
+) -> int:
+    """Stream batches from ffmpeg directly into the encoder pool.
 
-    Buffers the whole video in RAM (~10 MB for typical 100-frame keyframe
-    set) so the cropdetect-redo decision can be made before any batches
-    are submitted to the encoder pool. The encoder side then receives a
-    consistent, complete set of frames per video.
+    Does NOT buffer the whole video in RAM — each batch is submitted as soon
+    as it fills up, then immediately discarded from the caller. RAM stays at
+    O(encode_inflight × batch_size × 224²×3) regardless of video length.
+
+    cropdetect runs inline; if the first pass detected real letterbox we
+    discard the video from the indexer and re-decode with the crop applied.
+    The 1% re-decode case costs a second disk read for that file only.
     """
     inline_crop_mode = cfg.keyframes_only and getattr(cfg, "cropdetect", True)
     legacy_crop = (
@@ -58,10 +62,26 @@ def _decode_video_to_batches(
     )
     crops_seen: list[tuple[int, int, int, int]] = []
 
-    def _one_pass(crop_filter: str | None, collect_crops: bool):
-        batches: list[tuple[np.ndarray, np.ndarray]] = []
+    def _stream_pass(crop_filter: str | None, collect_crops: bool) -> int:
+        n = 0
         batch_imgs: list[np.ndarray] = []
         batch_ts: list[float] = []
+
+        def flush() -> int:
+            nonlocal batch_imgs, batch_ts
+            if not batch_imgs:
+                return 0
+            arr = np.stack(batch_imgs, axis=0)
+            ts = np.asarray(batch_ts, dtype=np.float32)
+            indexer.submit_batch(video_id, arr, ts, 0)
+            count = 1
+            if cfg.mirror:
+                arr_m = arr[:, :, ::-1, :].copy()
+                indexer.submit_batch(video_id, arr_m, ts, 1)
+                count += 1
+            batch_imgs, batch_ts = [], []
+            return count
+
         try:
             if cfg.keyframes_only:
                 it = frames.iter_keyframes(
@@ -78,30 +98,30 @@ def _decode_video_to_batches(
                 batch_imgs.append(img)
                 batch_ts.append(t)
                 if len(batch_imgs) >= cfg.batch_size:
-                    batches.append((np.stack(batch_imgs), np.asarray(batch_ts, dtype=np.float32)))
-                    batch_imgs, batch_ts = [], []
-            if batch_imgs:
-                batches.append((np.stack(batch_imgs), np.asarray(batch_ts, dtype=np.float32)))
+                    n += flush()
+            n += flush()
         except frames.FFmpegError as e:
             console.print(f"[red]skip[/red] {path.name}: {e}")
-            return None
-        return batches
+            return -1
+        return n
 
-    pass1 = _one_pass(legacy_crop, inline_crop_mode)
-    if pass1 is None:
-        return None
+    n_submitted = _stream_pass(legacy_crop, inline_crop_mode)
+    if n_submitted < 0:
+        return -1
 
     if inline_crop_mode and crops_seen:
         agg = frames.aggregate_crop(crops_seen, info.width, info.height)
         if agg and frames.is_significant_crop(agg, info.width, info.height):
             crop_str = f"crop={agg[0]}:{agg[1]}:{agg[2]}:{agg[3]}"
             console.print(f"[dim]re-decode with {crop_str} → {path.name[:60]}[/dim]")
+            indexer.discard(video_id)        # invalidates first-pass batches
+            indexer.register(video_id)
             crops_seen.clear()
-            pass2 = _one_pass(crop_str, False)
-            if pass2 is not None and pass2:
-                pass1 = pass2
+            n_submitted = _stream_pass(crop_str, False)
+            if n_submitted < 0:
+                return -1
 
-    return pass1
+    return n_submitted
 
 
 def index_paths(paths: list[Path], cfg: Config, store: Store, fe: FeatureExtractor) -> int:
@@ -127,10 +147,6 @@ def index_paths(paths: list[Path], cfg: Config, store: Store, fe: FeatureExtract
                 console.print(f"[red]skip[/red] {path.name}: {e}")
                 continue
 
-            batches = _decode_video_to_batches(path, cfg, info)
-            if not batches:
-                continue
-
             with indexer.store_lock:
                 store.init_index(fe.dim)
                 video_id = store.add_video(
@@ -138,14 +154,12 @@ def index_paths(paths: list[Path], cfg: Config, store: Store, fe: FeatureExtract
                 )
             indexer.register(video_id)
 
-            n_submitted = 0
-            for arr, ts in batches:
-                indexer.submit_batch(video_id, arr, ts, 0)
-                n_submitted += 1
-                if cfg.mirror:
-                    arr_m = arr[:, :, ::-1, :].copy()
-                    indexer.submit_batch(video_id, arr_m, ts, 1)
-                    n_submitted += 1
+            n_submitted = _decode_and_submit(path, cfg, info, indexer, video_id)
+            if n_submitted < 0:
+                indexer.discard(video_id)
+                with indexer.store_lock:
+                    store.mark_failed(video_id)
+                continue
             indexer.mark_decoded(video_id, n_submitted)
             added += 1
         except Exception as e:

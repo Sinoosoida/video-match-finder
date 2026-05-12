@@ -19,9 +19,11 @@ CREATE TABLE IF NOT EXISTS videos (
     width     INTEGER,
     height    INTEGER,
     n_frames  INTEGER NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'pending',
     added_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_videos_sha1 ON videos(sha1);
+CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -63,6 +65,13 @@ class Store:
         # is safe.
         self.db = sqlite3.connect(self.data_dir / "videos.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
+        # Migration: add status column on older indexes that pre-date it.
+        try:
+            self.db.execute(
+                "ALTER TABLE videos ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'"
+            )
+        except sqlite3.OperationalError:
+            pass    # column already exists
         self.db.commit()
 
         self._index_path = self.data_dir / "index.faiss"
@@ -110,14 +119,48 @@ class Store:
         return {r[0] for r in self.db.execute("SELECT sha1 FROM videos")}
 
     def has_video(self, path: Path, sha1: str) -> bool:
+        """Return True only for videos that finished indexing successfully.
+
+        Videos that failed (or were interrupted) stay at status='pending' so
+        they get retried on the next scan."""
         row = self.db.execute(
-            "SELECT 1 FROM videos WHERE path=? OR sha1=? LIMIT 1", (str(path), sha1)
+            "SELECT 1 FROM videos WHERE status='complete' AND (path=? OR sha1=?) LIMIT 1",
+            (str(path), sha1),
         ).fetchone()
         return row is not None
 
+    def mark_complete(self, video_id: int) -> None:
+        self.db.execute("UPDATE videos SET status='complete' WHERE id=?", (video_id,))
+        self.db.commit()
+
+    def mark_failed(self, video_id: int) -> None:
+        self.db.execute("UPDATE videos SET status='failed' WHERE id=?", (video_id,))
+        self.db.commit()
+
     def add_video(self, path: Path, sha1: str, duration: float, w: int, h: int, n_frames: int) -> int:
+        """Insert (or recycle) a video row in 'pending' state.
+
+        If the path already has a non-complete row from a prior failed/aborted
+        scan, that row is deleted and any frame_meta vectors tagged to it are
+        tombstoned (video_id negated → filtered out at search time).
+        """
+        row = self.db.execute(
+            "SELECT id, status FROM videos WHERE path=?", (str(path),)
+        ).fetchone()
+        if row is not None:
+            old_id, old_status = int(row[0]), row[1]
+            if old_status == "complete":
+                # caller should have skipped via has_video(); honour idempotency
+                return old_id
+            # Tombstone old vectors (set video_id to a negative value)
+            if len(self.frame_meta):
+                mask = self.frame_meta["video_id"] == old_id
+                if mask.any():
+                    self.frame_meta["video_id"][mask] = -old_id - 1
+            self.db.execute("DELETE FROM videos WHERE id=?", (old_id,))
         cur = self.db.execute(
-            "INSERT INTO videos(path, sha1, duration, width, height, n_frames) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO videos(path, sha1, duration, width, height, n_frames, status)"
+            " VALUES (?,?,?,?,?,?,'pending')",
             (str(path), sha1, duration, w, h, n_frames),
         )
         self.db.commit()
