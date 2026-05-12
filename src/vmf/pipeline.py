@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -39,7 +40,14 @@ def discover_videos(roots: Iterable[Path]) -> list[Path]:
 
 
 def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
-    """Return (vectors, timestamps, mirror_flags, info) or None on failure."""
+    """Return (vectors, timestamps, mirror_flags, info) or None on failure.
+
+    Pipelined: ffmpeg keeps decoding while encode-batches are sent to the
+    extractor concurrently. The main loop submits batches to a thread pool
+    and blocks only when `encode_inflight` jobs are already in flight,
+    keeping ffmpeg, JPEG-encode, network/IO, and the GPU (or remote GPU)
+    overlapped end-to-end without buffering an entire video in RAM.
+    """
     try:
         info = frames.probe(path)
     except frames.FFmpegError as e:
@@ -47,49 +55,71 @@ def _encode_video(path: Path, fe: FeatureExtractor, cfg: Config):
         return None
 
     crop = frames.detect_crop(path)
-    vecs: list[np.ndarray] = []
-    ts: list[float] = []
-    mir: list[int] = []
+    n_inflight = max(1, getattr(cfg, "encode_inflight", 2))
+
+    # Each collected chunk is (vecs, ts, mirror_flag). Ordering is irrelevant
+    # because per-vector (video_id, ts, mirrored) metadata travels with it.
+    collected: list[tuple[np.ndarray, np.ndarray, int]] = []
+    inflight: list[tuple[Future, np.ndarray, int]] = []
+
+    def drain_one() -> bool:
+        if not inflight:
+            return False
+        fut, ts, mflag = inflight.pop(0)
+        try:
+            v = fut.result()
+        except Exception as e:
+            console.print(f"[red]encode error[/red] {path.name}: {e}")
+            raise
+        collected.append((v, ts, mflag))
+        return True
+
+    def maybe_drain() -> None:
+        while len(inflight) >= n_inflight:
+            drain_one()
 
     batch_imgs: list[np.ndarray] = []
     batch_ts: list[float] = []
 
-    def flush():
+    def submit_batch(ex: ThreadPoolExecutor) -> None:
         if not batch_imgs:
             return
         arr = np.stack(batch_imgs, axis=0)
-        v = fe.encode(arr)
-        vecs.append(v)
-        ts.extend(batch_ts)
-        mir.extend([0] * len(batch_ts))
+        ts_arr = np.asarray(batch_ts, dtype=np.float32)
+        maybe_drain()
+        inflight.append((ex.submit(fe.encode, arr), ts_arr, 0))
         if cfg.mirror:
             arr_m = arr[:, :, ::-1, :].copy()
-            v_m = fe.encode(arr_m)
-            vecs.append(v_m)
-            ts.extend(batch_ts)
-            mir.extend([1] * len(batch_ts))
+            maybe_drain()
+            inflight.append((ex.submit(fe.encode, arr_m), ts_arr, 1))
         batch_imgs.clear()
         batch_ts.clear()
 
     try:
-        for t, img in frames.iter_frames(
-            path, fps=cfg.fps, size=cfg.frame_size, crop=crop,
-            min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
-        ):
-            batch_imgs.append(img)
-            batch_ts.append(t)
-            if len(batch_imgs) >= cfg.batch_size:
-                flush()
-        flush()
+        with ThreadPoolExecutor(max_workers=n_inflight) as ex:
+            for t, img in frames.iter_frames(
+                path, fps=cfg.fps, size=cfg.frame_size, crop=crop,
+                min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
+            ):
+                batch_imgs.append(img)
+                batch_ts.append(t)
+                if len(batch_imgs) >= cfg.batch_size:
+                    submit_batch(ex)
+            submit_batch(ex)
+            while drain_one():
+                pass
     except frames.FFmpegError as e:
         console.print(f"[red]skip[/red] {path.name}: {e}")
         return None
 
-    if not vecs:
+    if not collected:
         return None
-    vectors = np.concatenate(vecs, axis=0)
-    timestamps = np.asarray(ts, dtype=np.float32)
-    mirror_flags = np.asarray(mir, dtype=np.int8)
+    vectors = np.concatenate([c[0] for c in collected], axis=0)
+    timestamps = np.concatenate([c[1] for c in collected], axis=0)
+    mirror_flags = np.concatenate(
+        [np.full(len(c[0]), c[2], dtype=np.int8) for c in collected],
+        axis=0,
+    )
     return vectors, timestamps, mirror_flags, info
 
 

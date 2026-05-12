@@ -22,6 +22,7 @@ class Config:
     frame_size: int = 224
     model: str = "auto"               # auto | dinov2_vits14 | dinov2_vitb14
     batch_size: int = 32
+    encode_inflight: int = 2          # batches sent concurrently while ffmpeg keeps decoding
     knn: int = 10
     min_pair_matches: int = 20        # ↑ from 15 — at fps=2 noise clouds are denser too
     ransac_iters: int = 10_000        # exhaustive search — finds faint real lines reliably
