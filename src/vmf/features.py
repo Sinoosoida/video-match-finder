@@ -158,17 +158,21 @@ class RemoteFeatureExtractor:
 
     def __post_init__(self):
         import httpx
-        # Disable keep-alive pooling. With concurrent encode() calls from the
-        # pipelined encoder (`encode_inflight`>1) and uvicorn closing idle
-        # keep-alive sockets, reused connections often arrive at the server
-        # after it has already closed them — yielding "Server disconnected
-        # without sending a response". Fresh connection per request is a few
-        # ms of extra TCP/TLS overhead and rock-solid under concurrency.
+        # Keep-alive reuse matters a lot when the client talks through a
+        # high-latency hop (SSH tunnel, WAN). A fresh TCP handshake costs
+        # 1–2 RTT — for our 800 ms-RTT SSH tunnel that's ≈ 1 s of pure
+        # overhead per batch, dwarfing JPEG-encode and even GPU forward.
+        # Stale-keepalive races (server closed the socket while we were
+        # sending) are absorbed by the retry loop in encode().
         self._client = httpx.Client(
             base_url=self.endpoint.rstrip("/"),
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=httpx.Timeout(180.0, connect=15.0),
-            limits=httpx.Limits(max_keepalive_connections=0),
+            limits=httpx.Limits(
+                max_connections=64,
+                max_keepalive_connections=32,
+                keepalive_expiry=600.0,
+            ),
         )
 
     def encode(self, frames: np.ndarray) -> np.ndarray:

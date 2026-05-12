@@ -37,6 +37,7 @@ def _make_config(
     legacy_ransac: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
+    inflight: Optional[int] = None,
 ) -> Config:
     cfg = Config()
     if legacy_ransac:
@@ -45,6 +46,8 @@ def _make_config(
         cfg.endpoint = endpoint
     if api_key is not None:
         cfg.api_key = api_key
+    if inflight is not None and inflight >= 1:
+        cfg.encode_inflight = inflight
     if data_dir is not None:
         cfg.data_dir = data_dir
     if fps is not None:
@@ -81,6 +84,11 @@ API_KEY_OPT = typer.Option(
     help="Bearer token for --endpoint. Required when --endpoint is set.",
     envvar="VMF_API_KEY",
 )
+INFLIGHT_OPT = typer.Option(
+    None, "--inflight",
+    help="Encode batches kept in flight at once. Raise for high-RTT links "
+         "(rule of thumb: bandwidth × RTT / batch_size). Default: 8.",
+)
 
 
 @app.callback()
@@ -106,10 +114,11 @@ def index(
     no_mirror: bool = NO_MIRROR_OPT,
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
+    inflight: Optional[int] = INFLIGHT_OPT,
 ) -> None:
     """Add videos to the index without searching."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror,
-                       endpoint=endpoint, api_key=api_key)
+                       endpoint=endpoint, api_key=api_key, inflight=inflight)
     videos = discover_videos(paths)
     if not videos:
         console.print("[yellow]No videos found.[/yellow]")
@@ -132,11 +141,12 @@ def scan(
     legacy_ransac: bool = LEGACY_OPT,
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
+    inflight: Optional[int] = INFLIGHT_OPT,
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write JSON results to this file."),
 ) -> None:
     """Index a collection (if not already) and report overlapping pairs."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror, legacy_ransac,
-                       endpoint=endpoint, api_key=api_key)
+                       endpoint=endpoint, api_key=api_key, inflight=inflight)
     videos = discover_videos(paths)
     if not videos:
         console.print("[yellow]No videos found.[/yellow]")
@@ -163,11 +173,12 @@ def find(
     no_mirror: bool = NO_MIRROR_OPT,
     endpoint: Optional[str] = ENDPOINT_OPT,
     api_key: Optional[str] = API_KEY_OPT,
+    inflight: Optional[int] = INFLIGHT_OPT,
     json_out: Optional[Path] = typer.Option(None, "--json"),
 ) -> None:
     """Search the existing index for matches against a single query video."""
     cfg = _make_config(data_dir, fps, model, device, no_mirror,
-                       endpoint=endpoint, api_key=api_key)
+                       endpoint=endpoint, api_key=api_key, inflight=inflight)
     store = Store(cfg.data_dir)
     if store.index is None or store.index.ntotal == 0:
         console.print("[red]Index is empty. Run `vmf index` or `vmf scan` first.[/red]")

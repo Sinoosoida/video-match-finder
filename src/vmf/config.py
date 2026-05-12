@@ -22,7 +22,14 @@ class Config:
     frame_size: int = 224
     model: str = "auto"               # auto | dinov2_vits14 | dinov2_vitb14
     batch_size: int = 32
-    encode_inflight: int = 2          # batches sent concurrently while ffmpeg keeps decoding
+    # encode_inflight controls how many batches we keep in flight while ffmpeg
+    # keeps decoding the next ones. Bandwidth-delay product says we need
+    # roughly RTT / per-batch-time concurrent requests to saturate a fat pipe.
+    # The default 8 hides RTTs up to ~1 s when the server itself processes a
+    # batch in ~100–300 ms, so the bottleneck shifts to either ffmpeg-on-client
+    # or model-on-server rather than the network round-trip. Memory cost is
+    # minimal: ~5 MB of decoded frames per inflight slot.
+    encode_inflight: int = 8
     knn: int = 10
     min_pair_matches: int = 20        # ↑ from 15 — at fps=2 noise clouds are denser too
     ransac_iters: int = 10_000        # exhaustive search — finds faint real lines reliably
