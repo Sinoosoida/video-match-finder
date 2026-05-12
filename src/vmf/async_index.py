@@ -13,11 +13,14 @@ scan we skip only 'complete' rows, so any half-indexed video gets retried.
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 from rich.console import Console
+
+from vmf.log import log
 
 console = Console(stderr=True)
 
@@ -54,6 +57,33 @@ class AsyncIndexer:
         self.save_every = 25
         self._since_save = 0
 
+        # Counters for the periodic stats reporter
+        self.t_started = time.monotonic()
+        self.completed = 0
+        self.failed_videos = 0
+        self.batches_done = 0
+        self.batches_failed = 0
+        self.inflight_now = 0
+        self._stats_stop = threading.Event()
+        self._stats_thr = threading.Thread(
+            target=self._stats_loop, name="vmf-stats", daemon=True,
+        )
+        self._stats_thr.start()
+
+    def _stats_loop(self) -> None:
+        while not self._stats_stop.wait(10.0):
+            with self.lock:
+                pending = len(self.pending)
+                pending_ids = sorted(self.pending.keys())[:5]
+            elapsed = time.monotonic() - self.t_started
+            rate = self.completed / elapsed if elapsed > 0 else 0
+            log.info(
+                f"stats: elapsed={elapsed:6.0f}s  done={self.completed}  failed={self.failed_videos}"
+                f"  batches={self.batches_done} (errors={self.batches_failed})"
+                f"  inflight={self.inflight_now}  pending={pending} {pending_ids}"
+                f"  rate={rate*60:5.1f} vid/min"
+            )
+
     # -------- main-thread API --------
 
     def register(self, video_id: int) -> None:
@@ -63,7 +93,14 @@ class AsyncIndexer:
     def submit_batch(
         self, video_id: int, arr: np.ndarray, ts: np.ndarray, mirror_flag: int,
     ) -> None:
+        wait_start = time.monotonic()
         self.sem.acquire()
+        wait = time.monotonic() - wait_start
+        if wait > 1.0:
+            log.info(f"submit_batch vid={video_id} waited {wait:.1f}s for sem "
+                     f"(inflight saturated)")
+        with self.lock:
+            self.inflight_now += 1
         fut = self.pool.submit(self.fe.encode, arr)
         fut.add_done_callback(lambda f: self._on_done(video_id, ts, mirror_flag, f))
 
@@ -93,9 +130,14 @@ class AsyncIndexer:
         with self.cond:
             while self.pending:
                 self.cond.wait()
+        self._stats_stop.set()
         self.pool.shutdown(wait=True)
         with self.store_lock:
             self.store.save()
+        log.info(
+            f"wait_all done: completed={self.completed} failed={self.failed_videos} "
+            f"batches={self.batches_done} batch_errors={self.batches_failed}"
+        )
 
     # -------- worker callbacks --------
 
@@ -107,7 +149,13 @@ class AsyncIndexer:
             vecs = fut.result()
         except Exception as e:
             console.print(f"[red]encode error vid={video_id}: {e}[/red]")
+            log.warning(f"encode_error vid={video_id} mirror={mirror_flag}: {e}")
             vecs = None
+            with self.lock:
+                self.batches_failed += 1
+        else:
+            with self.lock:
+                self.batches_done += 1
 
         # IMMEDIATELY flush to FAISS — do not retain vecs in RAM.
         if vecs is not None:
@@ -135,6 +183,7 @@ class AsyncIndexer:
                     self.pending.pop(video_id, None)
                     finalize_target = st
                     self.cond.notify_all()
+            self.inflight_now = max(0, self.inflight_now - 1)
         self.sem.release()
         if finalize_target is not None:
             self._finalize(finalize_target)
@@ -143,10 +192,19 @@ class AsyncIndexer:
         with self.store_lock:
             if st.failed:
                 self.store.mark_failed(st.video_id)
+                with self.lock:
+                    self.failed_videos += 1
+                log.warning(f"finalize FAILED vid={st.video_id} "
+                            f"({st.received}/{st.expected} batches, n_frames={st.n_frames})")
             else:
                 self.store.update_n_frames(st.video_id, st.n_frames)
                 self.store.mark_complete(st.video_id)
+                with self.lock:
+                    self.completed += 1
+                log.info(f"finalize OK vid={st.video_id} "
+                         f"batches={st.expected} n_frames={st.n_frames}")
             self._since_save += 1
             if self._since_save >= self.save_every:
                 self.store.save()
                 self._since_save = 0
+                log.info(f"FAISS saved after {self.save_every} videos")

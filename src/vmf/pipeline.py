@@ -10,11 +10,13 @@ import numpy as np
 from rich.console import Console
 from tqdm import tqdm
 
+import time
 from vmf import align, frames, hough, weights
 from vmf.async_index import AsyncIndexer
 from vmf.config import VIDEO_EXTS, Config
 from vmf.features import FeatureExtractor, load_extractor, load_remote_extractor
 from vmf.index import Store, file_sha1
+from vmf.log import log
 
 console = Console(stderr=True)
 
@@ -44,6 +46,14 @@ def _decode_and_submit(
     path: Path, cfg: Config, info: "frames.VideoInfo",
     indexer, video_id: int,
 ) -> int:
+    t0 = time.monotonic()
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        size_mb = 0
+    log.info(f"video vid={video_id} start name={path.name!r} "
+             f"size={size_mb:.0f}MB dur={info.duration:.0f}s "
+             f"src_res={info.width}x{info.height}")
     """Stream batches from ffmpeg directly into the encoder pool.
 
     Does NOT buffer the whole video in RAM — each batch is submitted as soon
@@ -107,6 +117,7 @@ def _decode_and_submit(
 
     n_submitted = _stream_pass(legacy_crop, inline_crop_mode)
     if n_submitted < 0:
+        log.warning(f"video vid={video_id} ffmpeg failed first pass")
         return -1
 
     if inline_crop_mode and crops_seen:
@@ -114,13 +125,16 @@ def _decode_and_submit(
         if agg and frames.is_significant_crop(agg, info.width, info.height):
             crop_str = f"crop={agg[0]}:{agg[1]}:{agg[2]}:{agg[3]}"
             console.print(f"[dim]re-decode with {crop_str} → {path.name[:60]}[/dim]")
-            indexer.discard(video_id)        # invalidates first-pass batches
+            log.info(f"video vid={video_id} cropdetect non-trivial, re-decoding with {crop_str}")
+            indexer.discard(video_id)
             indexer.register(video_id)
             crops_seen.clear()
             n_submitted = _stream_pass(crop_str, False)
             if n_submitted < 0:
                 return -1
 
+    dt = time.monotonic() - t0
+    log.info(f"video vid={video_id} decode done in {dt:.1f}s, submitted {n_submitted} batches")
     return n_submitted
 
 
