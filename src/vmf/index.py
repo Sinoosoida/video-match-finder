@@ -436,23 +436,41 @@ class Store:
                     os.close(fd)
 
     def reset(self) -> None:
-        # Also clean up legacy artefacts from older index formats so that a
-        # `reset` always leaves a fresh data_dir.
-        legacy = [
-            self.data_dir / "index.faiss",   # old HNSWFlat in-RAM index
-            self.data_dir / "frames.npy",    # old single-shot numpy save
-            self.data_dir / "knn.faiss",     # IVFPQ cache from earlier iteration
-            self.data_dir / "knn_built_for_n.npy",
-            self.data_dir / "weights.npz",
-        ]
-        for p in (self._vectors_path, self._meta_path, *legacy):
-            if p.exists():
-                p.unlink()
-        self.db.execute("DELETE FROM videos")
-        self.db.execute("DELETE FROM meta")
-        self.db.commit()
+        self.force_clear(self.data_dir, db=self.db)
         self.frame_meta = np.empty(0, dtype=FRAME_DTYPE)
         self.dim = 0
+
+    @staticmethod
+    def force_clear(data_dir: Path, db: sqlite3.Connection | None = None) -> None:
+        """Wipe a data_dir regardless of format (current OR legacy). Safe to
+        call without instantiating a Store — that lets `vmf reset` recover
+        from data directories whose layout would otherwise be rejected by
+        `Store.__init__` (e.g. a leftover index.faiss after upgrading)."""
+        for name in (
+            "vectors.bin", "frames.bin",
+            # legacy artefacts
+            "index.faiss", "frames.npy",
+            "knn.faiss", "knn_built_for_n.npy",
+            "weights.npz",
+        ):
+            p = data_dir / name
+            if p.exists():
+                p.unlink()
+        if db is None:
+            db_path = data_dir / "videos.db"
+            if not db_path.exists():
+                return
+            db = sqlite3.connect(db_path)
+            close_after = True
+        else:
+            close_after = False
+        try:
+            db.execute("DELETE FROM videos")
+            db.execute("DELETE FROM meta")
+            db.commit()
+        finally:
+            if close_after:
+                db.close()
 
 
 class _IndexShim:

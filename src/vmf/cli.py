@@ -381,8 +381,10 @@ def reset(
         confirm = typer.confirm(f"Delete index at {cfg.data_dir}?")
         if not confirm:
             raise typer.Exit()
-    store = Store(cfg.data_dir)
-    store.reset()
+    # Bypass `Store(...)` here: legacy-format detection in __init__ raises,
+    # which would prevent `reset` from being usable for the very migration
+    # it exists to perform. force_clear works on any data_dir state.
+    Store.force_clear(cfg.data_dir)
     console.print("[green]Index cleared.[/green]")
 
 
