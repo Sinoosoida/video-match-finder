@@ -220,7 +220,7 @@ def find(
                        batch_size=batch_size,
                        keyframes_only=keyframes_only, no_cropdetect=no_cropdetect)
     store = Store(cfg.data_dir)
-    if store.index is None or store.index.ntotal == 0:
+    if store.n_vectors() == 0:
         console.print("[red]Index is empty. Run `vmf index` or `vmf scan` first.[/red]")
         raise typer.Exit(1)
     fe = ensure_extractor(cfg)
@@ -236,7 +236,7 @@ def status(data_dir: Optional[Path] = DATA_DIR_OPT) -> None:
     cfg = _make_config(data_dir, None, None, None, False)
     store = Store(cfg.data_dir)
     videos = store.list_videos()
-    n_vec = store.index.ntotal if store.index is not None else 0
+    n_vec = store.n_vectors()
     table = Table(title=f"Index: {cfg.data_dir}")
     table.add_column("ID", justify="right")
     table.add_column("Frames", justify="right")

@@ -52,10 +52,6 @@ class AsyncIndexer:
         self.cond = threading.Condition(self.lock)
         self.store_lock = threading.Lock()
         self.pending: dict[int, _VideoState] = {}
-        # Save FAISS periodically (after every N finalised videos), not after
-        # every video, so we don't rewrite a multi-MB file per video.
-        self.save_every = 25
-        self._since_save = 0
 
         # Counters for the periodic stats reporter
         self.t_started = time.monotonic()
@@ -190,6 +186,11 @@ class AsyncIndexer:
 
     def _finalize(self, st: _VideoState) -> None:
         with self.store_lock:
+            # Fsync vectors+metadata BEFORE updating sqlite status. Now
+            # mark_complete is crash-consistent: on power loss we either see
+            # 'pending' in the db (and the video gets retried on resume) or
+            # 'complete' with all its vectors durably on disk.
+            self.store.save()
             if st.failed:
                 self.store.mark_failed(st.video_id)
                 with self.lock:
@@ -203,8 +204,3 @@ class AsyncIndexer:
                     self.completed += 1
                 log.info(f"finalize OK vid={st.video_id} "
                          f"batches={st.expected} n_frames={st.n_frames}")
-            self._since_save += 1
-            if self._since_save >= self.save_every:
-                self.store.save()
-                self._since_save = 0
-                log.info(f"FAISS saved after {self.save_every} videos")

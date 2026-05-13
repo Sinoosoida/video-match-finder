@@ -13,37 +13,43 @@ We attach two continuous numbers to every frame in the index:
 Both are computed with the same softness exponent p, which controls how
 "identical" two frames must look to count as the same visual content.
 There are no thresholds — everything is continuous in cos similarity.
+
+This module reads vectors from the disk-backed Store *one video at a time*
+(for ρ) or in chunks (for idf), so peak RAM stays bounded regardless of
+corpus size.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-import faiss
 import numpy as np
 from rich.console import Console
 
 console = Console(stderr=True)
 
 
-def compute_self_redundancy(
-    vectors: np.ndarray, video_ids: np.ndarray, p: float,
-) -> np.ndarray:
+def compute_self_redundancy(store, *, p: float) -> np.ndarray:
     """ρ(i) = Σ_j max(0, vec_i · vec_j)^p, summed over j in the same video as i.
-    Includes self (sim=1 contributes 1), so ρ ≥ 1."""
-    n = len(vectors)
+    Includes self (sim=1 contributes 1), so ρ ≥ 1.
+
+    Loads one video's vectors at a time from disk; peak RAM is bounded by the
+    largest single video (≤ smooth_max_frames² × 4 bytes for the sim matrix)."""
+    n = store.n_vectors()
     rho = np.zeros(n, dtype=np.float32)
+    video_ids = store.frame_meta["video_id"]
     for vid in np.unique(video_ids):
-        mask = video_ids == vid
-        local = vectors[mask].astype(np.float32, copy=False)
+        idxs = np.where(video_ids == vid)[0]
+        if len(idxs) == 0:
+            continue
+        local = store.read_vectors(idxs).astype(np.float32, copy=False)
         sim = local @ local.T
         np.clip(sim, 0.0, 1.0, out=sim)
-        rho[mask] = (sim ** p).sum(axis=1)
+        rho[idxs] = (sim ** p).sum(axis=1)
     return rho
 
 
 def compute_idf(
-    vectors: np.ndarray, video_ids: np.ndarray, *,
-    p: float, n_videos: int, k: int = 50,
+    store, *, p: float, n_videos: int, k: int = 50, chunk: int = 5000,
 ) -> np.ndarray:
     """idf(i) = log((N+1) / (df(i)+1)) where
 
@@ -51,29 +57,32 @@ def compute_idf(
 
     The max over the foreign video gives the *best* match this frame finds
     there — small for unique frames, large for generic ones. Approximated
-    via top-k kNN: contributions from rank > k are dropped because they
-    would be tiny anyway.
-    """
-    n, d = vectors.shape
-    idx = faiss.IndexFlatIP(d)
-    idx.add(vectors.astype(np.float32, copy=False))
-    sims, nbrs = idx.search(vectors.astype(np.float32, copy=False), k + 1)
-    sims = np.clip(sims, 0.0, 1.0) ** p
+    via top-k kNN through the store's exact chunked kNN (100% recall)."""
+    n = store.n_vectors()
+    if n == 0:
+        return np.empty(0, dtype=np.float32)
+    video_ids = store.frame_meta["video_id"]
 
     df = np.zeros(n, dtype=np.float32)
-    nbr_vids = video_ids[nbrs]
-    for i in range(n):
-        self_vid = video_ids[i]
-        mask = nbr_vids[i] != self_vid
-        if not mask.any():
-            continue
-        vids = nbr_vids[i, mask]
-        ss = sims[i, mask]
-        uniq, inv = np.unique(vids, return_inverse=True)
-        max_per_vid = np.zeros(len(uniq), dtype=np.float32)
-        np.maximum.at(max_per_vid, inv, ss)
-        df[i] = max_per_vid.sum()
-
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        queries = store.read_vectors(slice(start, end)).astype(np.float32, copy=False)
+        sims, nbrs = store.search(queries, k + 1)
+        sims = np.clip(sims, 0.0, 1.0) ** p
+        # Vectorised over the chunk: for each query, drop neighbours from the
+        # same video as the query, then sum max-per-foreign-video.
+        nbr_vids = video_ids[nbrs]      # (chunk, k+1)
+        for i_local in range(end - start):
+            self_vid = video_ids[start + i_local]
+            mask = nbr_vids[i_local] != self_vid
+            if not mask.any():
+                continue
+            vids = nbr_vids[i_local, mask]
+            ss = sims[i_local, mask]
+            uniq, inv = np.unique(vids, return_inverse=True)
+            max_per_vid = np.zeros(len(uniq), dtype=np.float32)
+            np.maximum.at(max_per_vid, inv, ss)
+            df[start + i_local] = max_per_vid.sum()
     return np.log((n_videos + 1.0) / (df + 1.0)).astype(np.float32)
 
 
@@ -88,7 +97,6 @@ def load_weights(path: Path, *, p: float) -> tuple[np.ndarray, np.ndarray] | Non
     data = np.load(path)
     stored_p = float(data["p"]) if "p" in data.files else None
     if stored_p is not None and abs(stored_p - p) > 1e-6:
-        # exponent changed — caller must recompute
         return None
     return data["rho"], data["idf"]
 
@@ -103,15 +111,13 @@ def ensure_weights(
         if cached is not None:
             return cached
 
-    assert store.index is not None
-    n = store.index.ntotal
+    n = store.n_vectors()
     console.print(f"[cyan]Computing ρ, idf for {n} vectors (p={p})…[/cyan]")
-    vecs = np.vstack([store.index.reconstruct(i) for i in range(n)]).astype(np.float32)
     vids = store.frame_meta["video_id"]
     n_videos = int(np.unique(vids).size)
 
-    rho = compute_self_redundancy(vecs, vids, p=p)
-    idf = compute_idf(vecs, vids, p=p, n_videos=n_videos, k=k)
+    rho = compute_self_redundancy(store, p=p)
+    idf = compute_idf(store, p=p, n_videos=n_videos, k=k)
 
     save_weights(path, rho, idf, p=p)
     console.print(

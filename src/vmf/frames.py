@@ -16,6 +16,16 @@ class FFmpegError(RuntimeError):
     pass
 
 
+class TooManyKeyframesError(FFmpegError):
+    """Decoder yielded more frames than the per-video sanity threshold.
+
+    Catches videos where `-skip_frame nokey` silently fails at the decoder
+    level — notably AV1 (libdav1d, libaom), where the skip-frame hint is
+    not implemented. Without this check, such files would flood the index
+    with one vector per decoded frame instead of one per keyframe.
+    """
+
+
 @dataclass
 class VideoInfo:
     duration: float
@@ -114,6 +124,27 @@ def is_significant_crop(
     return w < tolerance * src_w or h < tolerance * src_h
 
 
+# Per-video keyframe budget. Most real videos have 0.1–2 keyframes/sec;
+# even dense legitimate encodings rarely exceed 3. A 5 kf/s cap is generous
+# for normal content and catches the "decoder didn't filter" failure mode
+# where extracted count scales with source fps (24–60+ kf/s).
+MAX_KEYFRAMES_PER_SECOND = 5.0
+# Absolute physical upper bound used when metadata duration is missing/zero.
+# 3 hours × 60 fps — no realistic video should yield more frames than this.
+ABSOLUTE_KEYFRAMES_CAP = 3 * 3600 * 60   # 648 000
+
+
+def max_keyframes_for(info: VideoInfo) -> int:
+    """Per-video upper bound on keyframes for the safety check in
+    `iter_keyframes`. Tighter when duration is known; falls back to a
+    very loose cap when it isn't."""
+    if info.duration <= 0:
+        return ABSOLUTE_KEYFRAMES_CAP
+    # +100 floor so short clips (< 20 s) still have a workable threshold.
+    soft = int(info.duration * MAX_KEYFRAMES_PER_SECOND) + 100
+    return min(soft, ABSOLUTE_KEYFRAMES_CAP)
+
+
 def iter_keyframes(
     path: Path,
     size: int,
@@ -122,6 +153,7 @@ def iter_keyframes(
     min_std: float = 0.0,
     hwaccel: bool = False,
     crops_out: list[tuple[int, int, int, int]] | None = None,
+    max_frames: int | None = None,
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Decode only keyframes (I-frames) — ~30–60× less CPU than full decode.
 
@@ -136,7 +168,15 @@ def iter_keyframes(
     appended; the caller can aggregate them after iteration to decide whether
     a second pass with crop pre-applied is warranted.
     """
-    vf = []
+    # `select=eq(pict_type,I)` is a safety net for codecs whose decoders
+    # silently ignore `-skip_frame nokey` (AV1 via libdav1d/libaom is the
+    # known case — the hint is just not implemented there). On H.264/HEVC
+    # the decoder has already filtered out non-key packets so this is a
+    # tautology that produces byte-identical output (verified by md5).
+    # On AV1 this is what actually filters keyframes — at the cost of full
+    # decoding (the decoder can't skip frames), but the resulting frame
+    # count is correct.
+    vf = ["select='eq(pict_type,I)'"]
     if crop:
         vf.append(crop)
     if crops_out is not None and crop is None:
@@ -198,6 +238,12 @@ def iter_keyframes(
             buf = proc.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
+            if max_frames is not None and idx >= max_frames:
+                raise TooManyKeyframesError(
+                    f"{path.name}: yielded > {max_frames} keyframes — the "
+                    f"decoder is probably not honouring `-skip_frame nokey` "
+                    f"for this codec (typical with AV1)"
+                )
             arr = np.frombuffer(buf, dtype=np.uint8).reshape(size, size, 3)
             # showinfo line for this frame usually arrives just before the raw
             # bytes; spin briefly waiting if not.

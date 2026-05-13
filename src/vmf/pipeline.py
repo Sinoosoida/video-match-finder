@@ -71,6 +71,12 @@ def _decode_and_submit(
         else None
     )
     crops_seen: list[tuple[int, int, int, int]] = []
+    # Per-video sanity threshold for keyframe extraction (catches decoder bugs
+    # like AV1 silently ignoring -skip_frame nokey). Raises TooManyKeyframesError
+    # if exceeded; index_paths catches that and marks the video as 'rejected'.
+    max_keyframes = frames.max_keyframes_for(info) if cfg.keyframes_only else None
+    if max_keyframes is not None:
+        log.info(f"video vid={video_id} max_keyframes={max_keyframes}")
 
     def _stream_pass(crop_filter: str | None, collect_crops: bool) -> int:
         n = 0
@@ -98,6 +104,7 @@ def _decode_and_submit(
                     path, size=cfg.frame_size, crop=crop_filter,
                     min_std=cfg.min_frame_std, hwaccel=cfg.hwaccel,
                     crops_out=crops_seen if collect_crops else None,
+                    max_frames=max_keyframes,
                 )
             else:
                 it = frames.iter_frames(
@@ -110,6 +117,10 @@ def _decode_and_submit(
                 if len(batch_imgs) >= cfg.batch_size:
                     n += flush()
             n += flush()
+        except frames.TooManyKeyframesError:
+            # Don't fold into FFmpegError handling — caller wants to mark this
+            # as 'rejected' (no retry) rather than 'failed' (retry on next scan).
+            raise
         except frames.FFmpegError as e:
             console.print(f"[red]skip[/red] {path.name}: {e}")
             return -1
@@ -176,6 +187,16 @@ def index_paths(paths: list[Path], cfg: Config, store: Store, fe: FeatureExtract
                 continue
             indexer.mark_decoded(video_id, n_submitted)
             added += 1
+        except frames.TooManyKeyframesError as e:
+            # Sanity threshold tripped — likely a codec where -skip_frame nokey
+            # silently fails (AV1, etc). Mark 'rejected' so we don't retry
+            # endlessly on every scan.
+            console.print(f"[yellow]reject[/yellow] {path.name}: {e}")
+            log.warning(f"video REJECTED {path.name!r}: {e}")
+            indexer.discard(video_id)
+            with indexer.store_lock:
+                store.mark_rejected(video_id)
+            continue
         except Exception as e:
             console.print(f"[red]unexpected error[/red] {path.name}: {e}")
             continue
@@ -240,12 +261,13 @@ def _build_mutual_kset(idx_mat: np.ndarray) -> set[tuple[int, int]]:
 
 
 def find_pairs(cfg: Config, store: Store) -> list[PairResult]:
-    if store.index is None or store.index.ntotal == 0:
+    if store.n_vectors() == 0:
         return []
 
-    n = store.index.ntotal
-    all_vecs = np.vstack([store.index.reconstruct(i) for i in range(n)]).astype(np.float32)
-    sims_mat, idx_mat = store.search(all_vecs, cfg.knn + 1)
+    n = store.n_vectors()
+    # Don't materialise all vectors in RAM — chunked exact self-kNN, streams
+    # database chunks from mmap'd vectors.bin. 100% recall, bounded RAM.
+    sims_mat, idx_mat = store.search_chunked(n, cfg.knn + 1)
     meta = store.frame_meta
 
     bad_vecs = _detect_watermark_ids(idx_mat, meta, cfg.watermark_max_videos)
@@ -335,18 +357,18 @@ def find_pairs_smooth(cfg: Config, store: Store) -> list[PairResult]:
       4. Accept if p < smooth_max_pvalue.
       5. Extent extracted from raw similarity along the accepted line.
     """
-    if store.index is None or store.index.ntotal == 0:
+    if store.n_vectors() == 0:
         return []
 
-    n = store.index.ntotal
-    all_vecs = np.vstack([store.index.reconstruct(i) for i in range(n)]).astype(np.float32)
+    n = store.n_vectors()
     meta = store.frame_meta
 
     # Per-frame weights (cached on disk by exponent p)
     rho, idf = weights.ensure_weights(store, p=cfg.smooth_p, k=cfg.smooth_idf_k)
 
-    # Pre-filter via raw kNN (just to skip clearly-disjoint pairs)
-    sims_mat, idx_mat = store.search(all_vecs, cfg.knn + 1)
+    # Pre-filter via exact kNN (just to skip clearly-disjoint video pairs).
+    # Chunked: streams query and database chunks from disk, lossless.
+    sims_mat, idx_mat = store.search_chunked(n, cfg.knn + 1)
     candidates = _candidate_pairs_from_knn(cfg, store, sims_mat, idx_mat)
     console.print(f"[dim]{len(candidates)} candidate pair(s) to score with Hough+permutation…[/dim]")
 
@@ -371,7 +393,10 @@ def find_pairs_smooth(cfg: Config, store: Store) -> list[PairResult]:
             ai = ai[np.linspace(0, len(ai) - 1, MAX_FRAMES).astype(np.int64)]
         if len(bi) > MAX_FRAMES:
             bi = bi[np.linspace(0, len(bi) - 1, MAX_FRAMES).astype(np.int64)]
-        vA, vB = all_vecs[ai], all_vecs[bi]
+        # Read vectors for only this pair from disk (mmap'd) — at most
+        # 2 × MAX_FRAMES rows, bounded RAM per pair.
+        vA = store.read_vectors(ai).astype(np.float32, copy=False)
+        vB = store.read_vectors(bi).astype(np.float32, copy=False)
         tA = meta["ts"][ai].astype(np.float32)
         tB = meta["ts"][bi].astype(np.float32)
 
@@ -431,7 +456,7 @@ def find_pairs_smooth(cfg: Config, store: Store) -> list[PairResult]:
 
 
 def query_against_index(query: Path, cfg: Config, store: Store, fe: FeatureExtractor) -> list[PairResult]:
-    if store.index is None or store.index.ntotal == 0:
+    if store.n_vectors() == 0:
         return []
     result = _encode_video(query, fe, cfg)
     if result is None:
