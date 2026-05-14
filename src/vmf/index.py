@@ -32,6 +32,15 @@ from typing import Iterator
 import faiss
 import numpy as np
 
+# Tell FAISS to use all available CPU cores for the BLAS-backed brute-force
+# kNN. Without this it often runs single-threaded, halving (or worse) our
+# usable throughput on multi-core boxes.
+try:
+    import multiprocessing as _mp
+    faiss.omp_set_num_threads(max(1, _mp.cpu_count()))
+except (AttributeError, OSError, NotImplementedError):
+    pass
+
 FRAME_DTYPE = np.dtype([("video_id", np.int32), ("ts", np.float32), ("mirrored", np.int8)])
 
 SCHEMA = """
@@ -138,6 +147,10 @@ class Store:
                 with open(self._meta_path, "wb") as f:
                     f.write(self.frame_meta.tobytes())
 
+        # Lazy in-RAM cache of the full corpus (see `_ensure_cached`).
+        self._cached: np.ndarray | None = None
+        self._cache_attempted: bool = False
+
     # -------- meta --------
 
     def _read_meta(self, key: str) -> str | None:
@@ -178,6 +191,17 @@ class Store:
             "SELECT 1 FROM videos WHERE status IN ('complete','rejected') "
             "AND (path=? OR sha1=?) LIMIT 1",
             (str(path), sha1),
+        ).fetchone()
+        return row is not None
+
+    def has_video_by_path(self, path: Path) -> bool:
+        """Cheap path-only check. Used by `index_paths` to skip a video
+        without computing its sha1, which on a slow disk costs ~1s/file
+        and dominates the resume time when nothing changed since last scan."""
+        row = self.db.execute(
+            "SELECT 1 FROM videos WHERE status IN ('complete','rejected') "
+            "AND path=? LIMIT 1",
+            (str(path),),
         ).fetchone()
         return row is not None
 
@@ -315,6 +339,104 @@ class Store:
             end = min(start + chunk, n)
             yield start, np.ascontiguousarray(mm[start:end])
 
+    # -------- in-RAM cache --------
+    #
+    # The big perf risk for chunked exact kNN is page-cache thrashing when
+    # vectors.bin (n × dim × 4 bytes) doesn't fit in RAM: we walk through it
+    # once per query chunk (≈ n_chunks² re-reads). The fix is to keep the
+    # whole corpus in RAM, in float16 if float32 won't fit. fp16 halves the
+    # bytes (~1.5 GB for 1M × 768 instead of 3 GB) and for L2-normalised
+    # DINOv2 embeddings the precision loss is far below the matching
+    # thresholds we care about. The matmul itself still happens in float32 —
+    # we just convert chunks on the fly.
+
+    def _ensure_cached(self) -> np.ndarray | None:
+        """Lazily load the full corpus into RAM (fp32 if it fits comfortably,
+        else fp16). Returns None when even fp16 wouldn't fit. Once loaded the
+        cache is kept until `clear_cache()` is called."""
+        if self._cache_attempted:
+            return self._cached
+        self._cache_attempted = True
+
+        n = self.n_vectors()
+        if n == 0 or self.dim == 0 or not self._vectors_path.exists():
+            return None
+
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            budget = mem.available + swap.free  # what we could plausibly use
+        except ImportError:
+            return None
+
+        fp32_bytes = n * self.dim * 4
+        fp16_bytes = n * self.dim * 2
+
+        # Need extra room for chunks, FAISS internals, top-k buffers and the
+        # OS itself; require ~20% headroom over the cache size.
+        if fp32_bytes * 1.2 < budget:
+            dtype = np.float32
+        elif fp16_bytes * 1.2 < budget:
+            dtype = np.float16
+        else:
+            return None
+
+        try:
+            arr = np.empty((n, self.dim), dtype=dtype)
+        except (MemoryError, OSError):
+            return None
+
+        LOAD = 50_000
+        mm = np.memmap(
+            self._vectors_path, dtype=np.float32, mode="r",
+            shape=(n, self.dim),
+        )
+        try:
+            for start in range(0, n, LOAD):
+                end = min(start + LOAD, n)
+                block = mm[start:end]
+                if dtype == np.float32:
+                    arr[start:end] = block
+                else:
+                    arr[start:end] = block.astype(dtype, copy=False)
+        finally:
+            del mm
+
+        self._cached = arr
+        try:
+            from vmf.log import log
+            log.info(
+                f"store: cached {n} vectors in RAM as {np.dtype(dtype).name} "
+                f"({arr.nbytes / 1e9:.2f} GB) — kNN will be I/O-free"
+            )
+        except Exception:
+            pass
+        return arr
+
+    def clear_cache(self) -> None:
+        """Drop the in-RAM cache so the memory is reclaimable by callers
+        that no longer need fast random access (e.g. after the kNN phase
+        we move on to Hough scoring, which reads only ~600 KB per pair)."""
+        self._cached = None
+        self._cache_attempted = False
+
+    def read_chunk(self, start: int, end: int) -> np.ndarray:
+        """Return vectors[start:end] as a contiguous float32 array. Uses the
+        in-RAM cache when populated, mmap otherwise. The conversion from fp16
+        is cheap relative to the per-chunk matmul that will consume the
+        result."""
+        if self._cached is None:
+            self._ensure_cached()
+        if self._cached is not None:
+            block = self._cached[start:end]
+            if block.dtype == np.float32:
+                return np.ascontiguousarray(block)
+            return np.ascontiguousarray(block.astype(np.float32, copy=False))
+        return np.ascontiguousarray(
+            self.read_vectors(slice(start, end)).astype(np.float32, copy=False)
+        )
+
     # -------- kNN index --------
 
     # Searches are stateless: each call to `search` streams the database
@@ -327,17 +449,17 @@ class Store:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Exact kNN: top-k for each query vector against the whole store.
 
-        Streams the database in chunks from mmap'd `vectors.bin`. For each
-        chunk D, a fresh `IndexFlatIP(D)` runs the BLAS-optimised exact
-        search; results are merged into a running top-k per query. RAM is
-        bounded by O(chunk × dim × 4) for queries+database, plus O(|vecs| × k)
-        for the running top-k buffer. 100% recall by construction."""
+        Streams the database in chunks (in-RAM cache when available, mmap
+        otherwise). For each chunk D, a fresh `IndexFlatIP(D)` runs the
+        BLAS-optimised exact search; results are merged into a running
+        top-k per query. 100% recall by construction."""
         n_q = int(len(vecs))
         n_db = self.n_vectors()
         if n_q == 0 or n_db == 0 or self.dim == 0:
             return (np.full((n_q, k), -1.0, dtype=np.float32),
                     np.full((n_q, k), -1, dtype=np.int64))
         Q = np.ascontiguousarray(vecs, dtype=np.float32)
+        self._ensure_cached()
         return self._exact_topk_against_store(Q, k, chunk)
 
     def search_chunked(
@@ -347,9 +469,11 @@ class Store:
         are read from the store itself in chunks (all-vs-all kNN); otherwise
         `queries_source` is a (start, end) → ndarray getter or an ndarray.
         Two-level chunking keeps both query and database RAM bounded."""
+        from_self = False
         if isinstance(queries_source, int):
             n_q = queries_source
-            get_queries = lambda a, b: self.read_vectors(slice(a, b))
+            get_queries = None        # use read_chunk (cache-aware)
+            from_self = True
         elif callable(queries_source):
             n_q = queries_source.__len__()   # type: ignore[union-attr]
             get_queries = queries_source
@@ -361,23 +485,55 @@ class Store:
             return (np.full((n_q, k), -1.0, dtype=np.float32),
                     np.full((n_q, k), -1, dtype=np.int64))
 
+        # Try to cache once up front; subsequent read_chunk calls benefit.
+        self._ensure_cached()
+
         sims_out = np.empty((n_q, k), dtype=np.float32)
         idxs_out = np.empty((n_q, k), dtype=np.int64)
-        for q_start in range(0, n_q, chunk):
+
+        try:
+            from vmf.log import log
+        except Exception:
+            log = None
+        import time as _t
+        n_chunks = (n_q + chunk - 1) // chunk
+        t0 = _t.monotonic()
+        if log is not None:
+            cached_note = ("cached in RAM" if self._cached is not None
+                           else "streaming via mmap (no RAM cache)")
+            log.info(
+                f"search_chunked: starting kNN over {n_q} queries × {n_db} db "
+                f"({n_chunks} q-chunks of {chunk}); {cached_note}"
+            )
+
+        for ci, q_start in enumerate(range(0, n_q, chunk)):
             q_end = min(q_start + chunk, n_q)
-            Q = np.ascontiguousarray(get_queries(q_start, q_end), dtype=np.float32)
+            if from_self:
+                Q = self.read_chunk(q_start, q_end)
+            else:
+                Q = np.ascontiguousarray(get_queries(q_start, q_end), dtype=np.float32)
             s, i = self._exact_topk_against_store(Q, k, chunk)
             sims_out[q_start:q_end] = s
             idxs_out[q_start:q_end] = i
+            if log is not None:
+                elapsed = _t.monotonic() - t0
+                done = ci + 1
+                eta = elapsed * (n_chunks - done) / done
+                log.info(
+                    f"search_chunked: q-chunk {done}/{n_chunks} "
+                    f"({100 * done / n_chunks:.1f}%) "
+                    f"elapsed={elapsed:.0f}s ETA={eta:.0f}s"
+                )
         return sims_out, idxs_out
 
     def _exact_topk_against_store(
         self, Q: np.ndarray, k: int, chunk: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Core: top-k for queries Q (already in RAM) against the full store
-        via chunked brute-force on mmap'd vectors. Merge of top-k across DB
-        chunks is associative, so the final result equals the exact global
-        top-k. No approximation."""
+        via chunked brute-force. Reads each DB chunk through `read_chunk` so
+        the cache (when populated) replaces disk I/O with in-RAM views. The
+        merge of top-k across DB chunks is associative; the final result
+        equals the exact global top-k. No approximation."""
         n_q = int(len(Q))
         n_db = self.n_vectors()
         sims = np.full((n_q, k), -np.inf, dtype=np.float32)
@@ -385,15 +541,11 @@ class Store:
 
         for d_start in range(0, n_db, chunk):
             d_end = min(d_start + chunk, n_db)
-            D = self.read_vectors(slice(d_start, d_end))
-            # FAISS IndexFlatIP uses BLAS GEMM under the hood — much faster
-            # than a hand-rolled numpy matmul + topk, especially for the
-            # per-row partial-sort phase.
+            D = self.read_chunk(d_start, d_end)
             sub = faiss.IndexFlatIP(self.dim)
             sub.add(D)
             k_local = min(k, d_end - d_start)
             s_block, i_block_local = sub.search(Q, k_local)
-            # Local FAISS indices → global indices into the store.
             i_block_global = np.where(
                 i_block_local >= 0, i_block_local + d_start, i_block_local,
             )
@@ -412,6 +564,7 @@ class Store:
             top = np.argpartition(-combined_s, k - 1, axis=1)[:, :k]
             sims = np.take_along_axis(combined_s, top, axis=1)
             idxs = np.take_along_axis(combined_i, top, axis=1)
+            del sub                          # release per-chunk FAISS state
 
         order = np.argsort(-sims, axis=1)
         sims = np.take_along_axis(sims, order, axis=1)

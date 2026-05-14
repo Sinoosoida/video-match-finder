@@ -163,6 +163,11 @@ def index_paths(paths: list[Path], cfg: Config, store: Store, fe: FeatureExtract
     pbar = tqdm(paths, desc="Indexing", unit="vid")
     for path in pbar:
         try:
+            # Fast-path resume: skip already-indexed videos without hashing
+            # them (sha1 of the first 64 MB is ~1 s on HDD, dominates the
+            # iteration when nothing has changed since last scan).
+            if store.has_video_by_path(path):
+                continue
             sha1 = file_sha1(path)
             if store.has_video(path, sha1):
                 continue
@@ -268,6 +273,7 @@ def find_pairs(cfg: Config, store: Store) -> list[PairResult]:
     # Don't materialise all vectors in RAM — chunked exact self-kNN, streams
     # database chunks from mmap'd vectors.bin. 100% recall, bounded RAM.
     sims_mat, idx_mat = store.search_chunked(n, cfg.knn + 1)
+    store.clear_cache()        # done with bulk reads, free the in-RAM cache
     meta = store.frame_meta
 
     bad_vecs = _detect_watermark_ids(idx_mat, meta, cfg.watermark_max_videos)
@@ -369,6 +375,10 @@ def find_pairs_smooth(cfg: Config, store: Store) -> list[PairResult]:
     # Pre-filter via exact kNN (just to skip clearly-disjoint video pairs).
     # Chunked: streams query and database chunks from disk, lossless.
     sims_mat, idx_mat = store.search_chunked(n, cfg.knn + 1)
+    # The big in-RAM cache that accelerated kNN is no longer useful for the
+    # Hough phase — Hough reads a few hundred KB per pair on demand. Free
+    # the ~1.5 GB now so the per-pair reads have OS page cache to land in.
+    store.clear_cache()
     candidates = _candidate_pairs_from_knn(cfg, store, sims_mat, idx_mat)
     console.print(f"[dim]{len(candidates)} candidate pair(s) to score with Hough+permutation…[/dim]")
 

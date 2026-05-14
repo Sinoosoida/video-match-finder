@@ -32,8 +32,8 @@ def compute_self_redundancy(store, *, p: float) -> np.ndarray:
     """ρ(i) = Σ_j max(0, vec_i · vec_j)^p, summed over j in the same video as i.
     Includes self (sim=1 contributes 1), so ρ ≥ 1.
 
-    Loads one video's vectors at a time from disk; peak RAM is bounded by the
-    largest single video (≤ smooth_max_frames² × 4 bytes for the sim matrix)."""
+    Per-video matrices are small (≤ smooth_max_frames² × 4 bytes). When the
+    store has an in-RAM cache populated, vector reads avoid disk entirely."""
     n = store.n_vectors()
     rho = np.zeros(n, dtype=np.float32)
     video_ids = store.frame_meta["video_id"]
@@ -63,10 +63,22 @@ def compute_idf(
         return np.empty(0, dtype=np.float32)
     video_ids = store.frame_meta["video_id"]
 
+    # Trigger the in-RAM cache up front so subsequent `store.search` calls
+    # don't keep faulting pages from disk on every chunk.
+    store._ensure_cached()
+
+    try:
+        from vmf.log import log
+    except Exception:
+        log = None
+    import time as _t
+
     df = np.zeros(n, dtype=np.float32)
-    for start in range(0, n, chunk):
+    n_chunks = (n + chunk - 1) // chunk
+    t0 = _t.monotonic()
+    for ci, start in enumerate(range(0, n, chunk)):
         end = min(start + chunk, n)
-        queries = store.read_vectors(slice(start, end)).astype(np.float32, copy=False)
+        queries = store.read_chunk(start, end)
         sims, nbrs = store.search(queries, k + 1)
         sims = np.clip(sims, 0.0, 1.0) ** p
         # Vectorised over the chunk: for each query, drop neighbours from the
@@ -83,6 +95,15 @@ def compute_idf(
             max_per_vid = np.zeros(len(uniq), dtype=np.float32)
             np.maximum.at(max_per_vid, inv, ss)
             df[start + i_local] = max_per_vid.sum()
+        if log is not None:
+            elapsed = _t.monotonic() - t0
+            done = ci + 1
+            eta = elapsed * (n_chunks - done) / done
+            log.info(
+                f"compute_idf: q-chunk {done}/{n_chunks} "
+                f"({100 * done / n_chunks:.1f}%) "
+                f"elapsed={elapsed:.0f}s ETA={eta:.0f}s"
+            )
     return np.log((n_videos + 1.0) / (df + 1.0)).astype(np.float32)
 
 
