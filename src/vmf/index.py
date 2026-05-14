@@ -366,18 +366,29 @@ class Store:
             import psutil
             mem = psutil.virtual_memory()
             swap = psutil.swap_memory()
-            budget = mem.available + swap.free  # what we could plausibly use
         except ImportError:
             return None
 
         fp32_bytes = n * self.dim * 4
         fp16_bytes = n * self.dim * 2
 
-        # Need extra room for chunks, FAISS internals, top-k buffers and the
-        # OS itself; require ~20% headroom over the cache size.
-        if fp32_bytes * 1.2 < budget:
+        # Pick dtype carefully — the cache is *only* useful if it stays
+        # resident in physical RAM. Letting it spill into swap brings back
+        # the very thrashing the cache exists to avoid (cf. the disk-mmap
+        # baseline that motivated all this). So:
+        #   - fp32 only when the corpus fits in RAM with real headroom for
+        #     per-chunk buffers, FAISS internals, etc.;
+        #   - fp16 when fp32 won't fit but RAM still covers it;
+        #   - fp16 with swap as last-resort fallback (we tolerate a small
+        #     amount of paging because fp16's footprint is half).
+        # Embedding values are L2-normalised — fp16 precision is far below
+        # the matching threshold we care about, so the quality hit is
+        # negligible.
+        if fp32_bytes * 1.4 < mem.available:
             dtype = np.float32
-        elif fp16_bytes * 1.2 < budget:
+        elif fp16_bytes * 1.15 < mem.available:
+            dtype = np.float16
+        elif fp16_bytes < mem.available + swap.free * 0.5:
             dtype = np.float16
         else:
             return None
@@ -445,7 +456,7 @@ class Store:
     # structure to build or warm up.
 
     def search(
-        self, vecs: np.ndarray, k: int, chunk: int = 5000,
+        self, vecs: np.ndarray, k: int, chunk: int = 10000,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Exact kNN: top-k for each query vector against the whole store.
 
@@ -463,7 +474,7 @@ class Store:
         return self._exact_topk_against_store(Q, k, chunk)
 
     def search_chunked(
-        self, queries_source, k: int, chunk: int = 5000,
+        self, queries_source, k: int, chunk: int = 10000,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Self-kNN entry point: when `queries_source` is an int N, queries
         are read from the store itself in chunks (all-vs-all kNN); otherwise
